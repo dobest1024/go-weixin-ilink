@@ -1,0 +1,23 @@
+# Token & session files (contain credentials)
+*.token.json
+.mirror-token.json
+.echo-bot-token.json
+
+# Context token directories
+.mirror-ctx/
+.echo-bot-ctx/
+
+# Sync buf cursor files
+*.syncbuf
+.mirror-syncbuf
+
+# Docs scratch
+docs/
+
+# IDE
+.idea/
+.vscode/
+
+# Build output
+*.exe
+*.test
