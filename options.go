@@ -25,6 +25,12 @@ type config struct {
 	syncBufStore      SyncBufStore
 	httpClient        *http.Client
 	logger            *slog.Logger
+
+	// Concurrency: max goroutines for message handling; 0 = serial (default).
+	maxWorkers int
+
+	// Lifecycle hooks
+	hooks Hooks
 }
 
 func defaultConfig() *config {
@@ -103,4 +109,16 @@ func WithHTTPClient(hc *http.Client) Option {
 // WithLogger sets the logger.
 func WithLogger(l *slog.Logger) Option {
 	return func(c *config) { c.logger = l }
+}
+
+// WithMaxWorkers sets the maximum number of concurrent message handlers.
+// 0 (default) means messages are processed serially in the polling goroutine.
+// A positive value spawns up to n goroutines for parallel message processing.
+func WithMaxWorkers(n int) Option {
+	return func(c *config) { c.maxWorkers = n }
+}
+
+// WithHooks sets lifecycle hooks for the bot.
+func WithHooks(h Hooks) Option {
+	return func(c *config) { c.hooks = h }
 }

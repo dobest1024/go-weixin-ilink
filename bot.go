@@ -89,7 +89,11 @@ func NewBot(opts ...Option) *Bot {
 // Otherwise the QR callback is invoked with base64-encoded QR image content.
 // Pass ilink.TerminalQR to render the code in the terminal automatically.
 func (b *Bot) Login(ctx context.Context, onQR QRCallback) error {
-	return b.authSvc.Login(ctx, onQR)
+	if err := b.authSvc.Login(ctx, onQR); err != nil {
+		return err
+	}
+	b.cfg.hooks.callOnLogin()
+	return nil
 }
 
 // Run starts the message-polling loop. Blocks until ctx is cancelled.
@@ -99,8 +103,11 @@ func (b *Bot) Run(ctx context.Context) error {
 	if b.c.getToken() == "" {
 		return ErrNotLoggedIn
 	}
-	b.polling = newPoller(b.c, b.handleMessage, b.cfg.channelVersion, b.cfg.logger, b.cfg.syncBufStore)
-	return b.polling.Run(ctx)
+	b.polling = newPoller(b.c, b.handleMessage, b.cfg.channelVersion, b.cfg.logger,
+		b.cfg.syncBufStore, b.cfg.maxWorkers, &b.cfg.hooks)
+	err := b.polling.Run(ctx)
+	b.cfg.hooks.callOnBotStop(err)
+	return err
 }
 
 // Stop gracefully stops the polling loop and waits for in-flight handlers.
@@ -338,6 +345,7 @@ func (b *Bot) handleMessage(ctx context.Context, msg *Message) error {
 			if r := recover(); r != nil {
 				b.cfg.logger.Error("handler panic recovered",
 					"from_user_id", msg.FromUserID, "panic", r)
+				b.cfg.hooks.callOnHandlerPanic(r, msg)
 			}
 		}()
 		b.dispatcher.dispatch(msgCtx)

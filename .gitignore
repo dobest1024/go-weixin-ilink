@@ -1,15 +1,14 @@
 # Token & session files (contain credentials)
 *.token.json
-.mirror-token.json
-.echo-bot-token.json
+.*.token.json
+.*-token.json
 
 # Context token directories
-.mirror-ctx/
-.echo-bot-ctx/
+*-ctx/
 
 # Sync buf cursor files
 *.syncbuf
-.mirror-syncbuf
+*-syncbuf
 
 # Docs scratch
 docs/
@@ -18,6 +17,10 @@ docs/
 .idea/
 .vscode/
 
-# Build output
+# Build output / binaries
 *.exe
 *.test
+/platform
+/mirror
+/echo
+/ai_bot

@@ -18,6 +18,8 @@ type poller struct {
 	channelVersion string
 	logger         *slog.Logger
 	syncBuf        SyncBufStore // optional; nil means in-memory only
+	hooks          *Hooks
+	maxWorkers     int // 0 = serial
 
 	mu            sync.Mutex
 	getUpdatesBuf string
@@ -26,13 +28,15 @@ type poller struct {
 	wg            sync.WaitGroup
 }
 
-func newPoller(c *client, handler messageHandler, channelVersion string, logger *slog.Logger, syncBuf SyncBufStore) *poller {
+func newPoller(c *client, handler messageHandler, channelVersion string, logger *slog.Logger, syncBuf SyncBufStore, maxWorkers int, hooks *Hooks) *poller {
 	p := &poller{
 		c:              c,
 		handler:        handler,
 		channelVersion: channelVersion,
 		logger:         logger,
 		syncBuf:        syncBuf,
+		hooks:          hooks,
+		maxWorkers:     maxWorkers,
 		stopCh:         make(chan struct{}),
 	}
 	// Restore persisted cursor on startup.
@@ -47,15 +51,15 @@ func newPoller(c *client, handler messageHandler, channelVersion string, logger 
 	return p
 }
 
-// Run starts the long-polling loop. Blocks until ctx is cancelled or session expires.
+// Run starts the long-polling loop. Blocks until ctx is cancelled or Stop is called.
 func (p *poller) Run(ctx context.Context) error {
 	const (
-		defaultTimeoutMs  = 35000
-		paddingMs         = 10000
-		minTimeoutMs      = 20000
-		maxConsecFails    = 3
-		backoffDelay      = 30 * time.Second
-		sessionPauseDur   = 1 * time.Hour
+		defaultTimeoutMs = 35000
+		paddingMs        = 10000
+		minTimeoutMs     = 20000
+		maxConsecFails   = 3
+		backoffDelay     = 30 * time.Second
+		sessionPauseDur  = 1 * time.Hour
 	)
 
 	inner, cancel := context.WithCancel(ctx)
@@ -64,8 +68,15 @@ func (p *poller) Run(ctx context.Context) error {
 	p.mu.Unlock()
 	defer cancel()
 
+	// Worker pool semaphore (nil = serial).
+	var sem chan struct{}
+	if p.maxWorkers > 0 {
+		sem = make(chan struct{}, p.maxWorkers)
+	}
+
 	httpTimeout := time.Duration(defaultTimeoutMs+paddingMs) * time.Millisecond
 	consecFails := 0
+	wasExpired := false
 
 	for {
 		select {
@@ -91,10 +102,9 @@ func (p *poller) Run(ctx context.Context) error {
 				return ErrPollerStopped
 			}
 			if IsSessionExpired(err) {
-				// Session expired (-14): pause for 1 hour then retry.
-				// The WeChat server rate-limits calls during this window;
-				// stopping would require a manual restart, so we pause instead.
+				p.hooks.callOnSessionExpired()
 				p.logger.Error("session expired, pausing for 1 hour before retry", "error", err)
+				wasExpired = true
 				select {
 				case <-ctx.Done():
 					return ctx.Err()
@@ -116,6 +126,7 @@ func (p *poller) Run(ctx context.Context) error {
 			}
 
 			consecFails++
+			p.hooks.callOnError(err)
 			p.logger.Warn("poll error", "error", err, "consecutive_fails", consecFails)
 			if consecFails >= maxConsecFails {
 				p.logger.Info("backing off", "delay", backoffDelay)
@@ -133,6 +144,13 @@ func (p *poller) Run(ctx context.Context) error {
 
 		consecFails = 0
 
+		// If we were in session-expired state, this successful poll means recovery.
+		if wasExpired {
+			wasExpired = false
+			p.hooks.callOnSessionRecovered()
+			p.logger.Info("session recovered after pause")
+		}
+
 		if resp.LongPollingTimeoutMs > 0 {
 			t := time.Duration(resp.LongPollingTimeoutMs+paddingMs) * time.Millisecond
 			if t < time.Duration(minTimeoutMs)*time.Millisecond {
@@ -146,11 +164,27 @@ func (p *poller) Run(ctx context.Context) error {
 			if msg.MessageType != MessageTypeUser {
 				continue
 			}
+
 			p.wg.Add(1)
-			if err := p.handler(inner, msg); err != nil {
-				p.logger.Error("handler error", "error", err, "from_user_id", msg.FromUserID)
+			if sem != nil {
+				// Concurrent: acquire slot, spawn goroutine.
+				sem <- struct{}{}
+				go func(m *Message) {
+					defer func() {
+						<-sem
+						p.wg.Done()
+					}()
+					if err := p.handler(inner, m); err != nil {
+						p.logger.Error("handler error", "error", err, "from_user_id", m.FromUserID)
+					}
+				}(msg)
+			} else {
+				// Serial: process in-line.
+				if err := p.handler(inner, msg); err != nil {
+					p.logger.Error("handler error", "error", err, "from_user_id", msg.FromUserID)
+				}
+				p.wg.Done()
 			}
-			p.wg.Done()
 		}
 
 		if resp.GetUpdatesBuf != "" {

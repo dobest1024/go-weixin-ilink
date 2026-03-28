@@ -26,6 +26,11 @@ bot.Run(context.Background())
 
 - **路由调度**：`OnText / OnImage / OnVoice / OnFile / OnVideo / OnTextMatch` 等，告别 `if/else`
 - **中间件链**：`ctx.Next()` / `ctx.Abort()` 支持认证、限流、日志等横切关注点
+- **并发处理**：`WithMaxWorkers(n)` 开启 worker pool，多条消息并行处理
+- **生命周期 Hook**：`OnLogin / OnSessionExpired / OnBotStop / OnHandlerPanic` 等回调
+- **异步 QR 登录**：`LoginAsync()` 返回 `QRSession`，适合 Web 平台集成
+- **多 Bot 管理**：`BotManager` 统一管理多个 Bot 实例的创建/启动/停止
+- **批量推送**：`BatchSendText()` 并发群发，`SendQueue` 带限速的发送队列
 - **引用消息**：`ctx.HasQuote()` / `ctx.QuotedText()` 读取用户长按回复的内容
 - **媒体收发**：CDN 文件上传/下载，AES-128-ECB 自动加解密，支持图片/语音/文件/视频
 - **打字状态**：`ctx.Typing()` / `ctx.StopTyping()`，typing_ticket 按用户自动缓存 24 小时
@@ -53,6 +58,11 @@ go get github.com/dobest1024/go-weixin-ilink
 - [回复与发送](#回复与发送)
 - [媒体文件](#媒体文件)
 - [主动发送消息](#主动发送消息)
+- [并发处理](#并发处理)
+- [生命周期 Hook](#生命周期-hook)
+- [异步 QR 登录](#异步-qr-登录)
+- [多 Bot 管理](#多-bot-管理)
+- [批量推送与发送队列](#批量推送与发送队列)
 - [存储接口](#存储接口)
 - [错误处理](#错误处理)
 - [完整示例](#完整示例)
@@ -370,6 +380,152 @@ bot.SendVideo(ctx, userID, videoItem)
 
 ---
 
+## 并发处理
+
+默认消息串行处理。设置 `WithMaxWorkers(n)` 后，SDK 使用 worker pool 并行处理：
+
+```go
+bot := ilink.NewBot(
+    ilink.WithMaxWorkers(10), // 最多 10 个消息并发处理
+)
+```
+
+> **注意**：并发模式下 handler 必须是并发安全的（避免共享可变状态或加锁）。
+
+---
+
+## 生命周期 Hook
+
+通过 `WithHooks()` 注册回调，让上层应用感知连接状态变化：
+
+```go
+bot := ilink.NewBot(
+    ilink.WithHooks(ilink.Hooks{
+        OnLogin: func() {
+            log.Println("登录成功")
+        },
+        OnSessionExpired: func() {
+            log.Println("会话过期，将自动暂停 1 小时后重试")
+            // 通知管理员、更新平台状态等
+        },
+        OnSessionRecovered: func() {
+            log.Println("会话已恢复")
+        },
+        OnBotStop: func(err error) {
+            log.Printf("Bot 已停止: %v", err)
+        },
+        OnError: func(err error) {
+            log.Printf("轮询错误: %v", err)
+        },
+        OnHandlerPanic: func(recovered any, msg *ilink.Message) {
+            log.Printf("handler panic: %v, from: %s", recovered, msg.FromUserID)
+        },
+    }),
+)
+```
+
+所有 Hook 都是可选的，未设置的不会被调用。
+
+---
+
+## 异步 QR 登录
+
+Web 平台场景：前端请求二维码 → 展示给用户 → 轮询扫码状态。
+
+```go
+// 1. 获取 QR 码（非阻塞）
+session, err := bot.LoginAsync(ctx)
+if err != nil {
+    log.Fatal(err)
+}
+
+// 2. 返回给前端展示
+qrImageBase64 := session.QRImage()
+qrImageURL := session.QRImageURL()
+
+// 3. 前端轮询状态
+status := session.Status() // Pending → Scanned → Confirmed
+// 或阻塞等待
+err = session.Wait(ctx)
+```
+
+`LoginStatus` 枚举：`Pending` → `Scanned` → `Confirmed` / `Expired` / `Error`
+
+---
+
+## 多 Bot 管理
+
+平台需要为每个用户运行独立的 Bot 实例：
+
+```go
+manager := ilink.NewBotManager()
+
+// 创建并登录
+bot, _ := manager.Add("user_001",
+    ilink.WithTokenFile("data/user_001.token.json"),
+    ilink.WithContextTokenDir("data/user_001_ctx"),
+)
+bot.OnText(func(ctx *ilink.Context) { ctx.ReplyText("hi") })
+bot.Login(ctx, ilink.TerminalQR) // 或 bot.LoginAsync()
+
+// 启动
+manager.Start(ctx, "user_001")
+
+// 查看所有 Bot 状态
+for _, info := range manager.List() {
+    fmt.Printf("bot=%s status=%s\n", info.ID, info.Status)
+}
+
+// 停止单个
+manager.Stop("user_001")
+
+// 移除（停止并删除）
+manager.Remove("user_001")
+
+// 停止全部
+manager.StopAll()
+```
+
+---
+
+## 批量推送与发送队列
+
+### 批量发送（并发）
+
+```go
+results := bot.BatchSendText(ctx, []string{"user_a", "user_b", "user_c"}, "通知内容")
+for _, r := range results {
+    if r.Err != nil {
+        log.Printf("发送失败 user=%s err=%v", r.UserID, r.Err)
+    }
+}
+```
+
+### 发送队列（限速）
+
+适合股价提醒、定时推送等高频场景：
+
+```go
+queue := ilink.NewSendQueue(bot, 200*time.Millisecond, 1000) // 每 200ms 发一条，缓冲 1000 条
+go queue.Start(ctx)
+
+// 入队（非阻塞）
+resultCh := queue.EnqueueText("user_abc", "你关注的股票涨了！")
+
+// 等结果（可选）
+if err := <-resultCh; err != nil {
+    log.Printf("发送失败: %v", err)
+}
+
+// 查看排队数
+fmt.Println("排队中:", queue.Pending())
+
+// 停止
+queue.Stop()
+```
+
+---
+
 ## 存储接口
 
 所有存储接口均可替换为自定义实现（如 Redis、数据库等）。
@@ -634,14 +790,18 @@ func rateLimiter(interval time.Duration) ilink.HandlerFunc {
 ## 项目结构
 
 ```
-weixin-ilink-sdk/
+go-weixin-ilink/
 ├── bot.go          # Bot 主入口，路由注册，生命周期管理
 ├── context.go      # Context + 中间件链 + 回复/媒体辅助
 ├── dispatcher.go   # Matcher 接口 + 路由调度
 ├── message.go      # 协议类型（Message, MessageItem, RefMessage 等）
 ├── auth.go         # QR 扫码登录 + 凭证复用
-├── poller.go       # 长轮询循环（断点续传、session 自愈）
+├── auth_async.go   # 异步 QR 登录（LoginAsync / QRSession）
+├── poller.go       # 长轮询循环（断点续传、session 自愈、并发处理）
 ├── sender.go       # 底层发送函数
+├── sendqueue.go    # 批量发送 + 限速发送队列
+├── hooks.go        # 生命周期 Hook 定义
+├── manager.go      # 多 Bot 管理器（BotManager）
 ├── typing.go       # 打字状态管理（per-user ticket 缓存）
 ├── media.go        # CDN 上传/下载 + Build* 辅助函数
 ├── storage.go      # TokenStore / ContextTokenStore / SyncBufStore 接口及实现
