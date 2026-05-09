@@ -36,9 +36,10 @@ type uploadURLRequest struct {
 }
 
 type uploadURLResponse struct {
-	UploadURL   string `json:"upload_url"`
-	UploadParam string `json:"upload_param"`
-	Ret         int    `json:"ret"`
+	UploadURL     string `json:"upload_url"`
+	UploadParam   string `json:"upload_param"`
+	UploadFullURL string `json:"upload_full_url,omitempty"`
+	Ret           int    `json:"ret"`
 }
 
 type mediaManager struct {
@@ -47,14 +48,16 @@ type mediaManager struct {
 	logger         *slog.Logger
 	cdnBaseURL     string
 	channelVersion string
+	botAgent       string
 }
 
-func newMediaManager(c *client, httpClient *http.Client, cdnBaseURL, channelVersion string, logger *slog.Logger) *mediaManager {
+func newMediaManager(c *client, httpClient *http.Client, cdnBaseURL, channelVersion, botAgent string, logger *slog.Logger) *mediaManager {
 	return &mediaManager{
 		c:              c,
 		httpClient:     httpClient,
 		cdnBaseURL:     cdnBaseURL,
 		channelVersion: channelVersion,
+		botAgent:       botAgent,
 		logger:         logger,
 	}
 }
@@ -95,7 +98,7 @@ func (m *mediaManager) UploadFile(ctx context.Context, data []byte, toUserID, fi
 		FileSize:    len(encrypted),
 		NoNeedThumb: true,
 		AESKey:      hex.EncodeToString(aesKey),
-		BaseInfo:    &BaseInfo{ChannelVersion: m.channelVersion},
+		BaseInfo:    &BaseInfo{ChannelVersion: m.channelVersion, BotAgent: m.botAgent},
 	}
 	var uploadResp uploadURLResponse
 	if err := m.c.post(ctx, "/ilink/bot/getuploadurl", uploadReq, &uploadResp); err != nil {
@@ -105,11 +108,19 @@ func (m *mediaManager) UploadFile(ctx context.Context, data []byte, toUserID, fi
 		return nil, fmt.Errorf("getuploadurl failed: ret=%d", uploadResp.Ret)
 	}
 
-	cdnURL := fmt.Sprintf("%s/upload?encrypted_query_param=%s&filekey=%s",
-		m.cdnBaseURL,
-		url.QueryEscape(uploadResp.UploadParam),
-		url.QueryEscape(fileKey),
-	)
+	var cdnURL string
+	if uploadResp.UploadFullURL != "" {
+		cdnURL = uploadResp.UploadFullURL
+	} else if uploadResp.UploadParam != "" {
+		cdnURL = fmt.Sprintf("%s/upload?encrypted_query_param=%s&filekey=%s",
+			m.cdnBaseURL,
+			url.QueryEscape(uploadResp.UploadParam),
+			url.QueryEscape(fileKey),
+		)
+	} else {
+		return nil, fmt.Errorf("getuploadurl returned no upload URL")
+	}
+
 	encryptedParam, err := m.uploadToCDN(ctx, cdnURL, encrypted)
 	if err != nil {
 		return nil, fmt.Errorf("cdn upload: %w", err)
@@ -240,7 +251,11 @@ func (m *mediaManager) downloadFromCDN(ctx context.Context, cdnURL string) ([]by
 }
 
 // BuildDownloadURL constructs a CDN download URL from a CDNMedia.
+// If the server provided a full_url, it is used directly; otherwise falls back to client construction.
 func (m *mediaManager) BuildDownloadURL(media *CDNMedia) string {
+	if media.FullURL != "" {
+		return media.FullURL
+	}
 	return fmt.Sprintf("%s/download?encrypted_query_param=%s",
 		m.cdnBaseURL, url.QueryEscape(media.EncryptQueryParam))
 }

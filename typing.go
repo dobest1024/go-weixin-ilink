@@ -37,18 +37,20 @@ type ticketEntry struct {
 }
 
 type typingManager struct {
-	c      *client
-	logger *slog.Logger
+	c        *client
+	logger   *slog.Logger
+	botAgent string
 
 	mu      sync.RWMutex
 	tickets map[string]*ticketEntry // keyed by userID
 }
 
-func newTypingManager(c *client, logger *slog.Logger) *typingManager {
+func newTypingManager(c *client, logger *slog.Logger, botAgent string) *typingManager {
 	return &typingManager{
-		c:       c,
-		logger:  logger,
-		tickets: make(map[string]*ticketEntry),
+		c:        c,
+		logger:   logger,
+		botAgent: botAgent,
+		tickets:  make(map[string]*ticketEntry),
 	}
 }
 
@@ -67,7 +69,7 @@ func (tm *typingManager) getTicket(ctx context.Context, userID, contextToken str
 	req := &getConfigRequest{
 		IlinkUserID:  userID,
 		ContextToken: contextToken,
-		BaseInfo:     &BaseInfo{ChannelVersion: tm.c.channelVersion},
+		BaseInfo:     &BaseInfo{ChannelVersion: tm.c.channelVersion, BotAgent: tm.botAgent},
 	}
 	var resp getConfigResponse
 	if err := tm.c.post(ctx, "/ilink/bot/getconfig", req, &resp); err != nil {

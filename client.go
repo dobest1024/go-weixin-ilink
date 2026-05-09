@@ -10,6 +10,8 @@ import (
 	"io"
 	"math/big"
 	"net/http"
+	"strconv"
+	"strings"
 	"sync"
 )
 
@@ -20,14 +22,35 @@ type client struct {
 	token          string
 	httpClient     *http.Client
 	channelVersion string
+	appID          string
+	clientVersion  string // "iLink-App-ClientVersion" computed from channelVersion
 }
 
-func newClient(baseURL string, httpClient *http.Client, channelVersion string) *client {
+func newClient(baseURL string, httpClient *http.Client, channelVersion, appID string) *client {
 	return &client{
 		baseURL:        baseURL,
 		httpClient:     httpClient,
 		channelVersion: channelVersion,
+		appID:          appID,
+		clientVersion:  buildClientVersion(channelVersion),
 	}
+}
+
+// buildClientVersion encodes a semver "M.N.P" as uint32 in 0x00MMNNPP format.
+func buildClientVersion(version string) string {
+	parts := strings.SplitN(version, ".", 3)
+	var major, minor, patch int
+	if len(parts) >= 1 {
+		major, _ = strconv.Atoi(parts[0])
+	}
+	if len(parts) >= 2 {
+		minor, _ = strconv.Atoi(parts[1])
+	}
+	if len(parts) >= 3 {
+		patch, _ = strconv.Atoi(parts[2])
+	}
+	encoded := (major&0xff)<<16 | (minor&0xff)<<8 | (patch & 0xff)
+	return strconv.Itoa(encoded)
 }
 
 func (c *client) setToken(token string) {
@@ -80,6 +103,12 @@ func (c *client) do(ctx context.Context, method, path string, body, result inter
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("AuthorizationType", "ilink_bot_token")
 	req.Header.Set("X-WECHAT-UIN", generateUIN())
+	if c.appID != "" {
+		req.Header.Set("iLink-App-Id", c.appID)
+	}
+	if c.clientVersion != "" {
+		req.Header.Set("iLink-App-ClientVersion", c.clientVersion)
+	}
 	if token := c.getToken(); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)
 	}

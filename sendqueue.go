@@ -54,7 +54,7 @@ func (b *Bot) BatchSendItems(ctx context.Context, userIDs []string, items []Mess
 			msg := newBotMsg(userID, token, items)
 			results[idx] = BatchResult{
 				UserID: userID,
-				Err:    sendRaw(ctx, b.c, b.cfg.channelVersion, msg),
+				Err:    sendRaw(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, msg),
 			}
 		}(i, uid)
 	}
@@ -168,5 +168,5 @@ func (q *SendQueue) send(ctx context.Context, job *sendJob) {
 		return
 	}
 	msg := newBotMsg(job.task.UserID, token, job.task.Items)
-	job.result <- sendRaw(ctx, q.bot.c, q.bot.cfg.channelVersion, msg)
+	job.result <- sendRaw(ctx, q.bot.c, q.bot.cfg.channelVersion, q.bot.cfg.botAgent, msg)
 }

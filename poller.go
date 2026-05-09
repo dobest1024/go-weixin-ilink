@@ -16,6 +16,7 @@ type poller struct {
 	c              *client
 	handler        messageHandler
 	channelVersion string
+	botAgent       string
 	logger         *slog.Logger
 	syncBuf        SyncBufStore // optional; nil means in-memory only
 	hooks          *Hooks
@@ -28,11 +29,12 @@ type poller struct {
 	wg            sync.WaitGroup
 }
 
-func newPoller(c *client, handler messageHandler, channelVersion string, logger *slog.Logger, syncBuf SyncBufStore, maxWorkers int, hooks *Hooks) *poller {
+func newPoller(c *client, handler messageHandler, channelVersion string, logger *slog.Logger, syncBuf SyncBufStore, maxWorkers int, hooks *Hooks, botAgent string) *poller {
 	p := &poller{
 		c:              c,
 		handler:        handler,
 		channelVersion: channelVersion,
+		botAgent:       botAgent,
 		logger:         logger,
 		syncBuf:        syncBuf,
 		hooks:          hooks,
@@ -208,7 +210,7 @@ func (p *poller) poll(ctx context.Context) (*GetUpdatesResponse, error) {
 
 	req := &GetUpdatesRequest{
 		GetUpdatesBuf: buf,
-		BaseInfo:      &BaseInfo{ChannelVersion: p.channelVersion},
+		BaseInfo:      &BaseInfo{ChannelVersion: p.channelVersion, BotAgent: p.botAgent},
 	}
 	var resp GetUpdatesResponse
 	if err := p.c.post(ctx, "/ilink/bot/getupdates", req, &resp); err != nil {

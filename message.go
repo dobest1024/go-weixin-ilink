@@ -152,6 +152,7 @@ type CDNMedia struct {
 	EncryptQueryParam string `json:"encrypt_query_param,omitempty"`
 	AESKey            string `json:"aes_key,omitempty"` // base64(hex_string) for outbound
 	EncryptType       int    `json:"encrypt_type,omitempty"`
+	FullURL           string `json:"full_url,omitempty"` // server-provided complete download URL (2.4.3+)
 }
 
 // ImageItem carries image content.
@@ -203,6 +204,7 @@ type VideoItem struct {
 // BaseInfo carries the channel version metadata required by every API call.
 type BaseInfo struct {
 	ChannelVersion string `json:"channel_version"`
+	BotAgent       string `json:"bot_agent,omitempty"`
 }
 
 // GetUpdatesRequest is the request body for POST /ilink/bot/getupdates.

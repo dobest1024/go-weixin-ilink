@@ -129,14 +129,14 @@ func (c *Context) IsPrivate() bool { return c.Message.IsPrivate() }
 
 // ReplyText sends a text reply to the message sender.
 func (c *Context) ReplyText(text string) error {
-	return sendText(c.Ctx, c.bot.c, c.bot.cfg.channelVersion,
+	return sendText(c.Ctx, c.bot.c, c.bot.cfg.channelVersion, c.bot.cfg.botAgent,
 		c.Message.FromUserID, text, c.Message.ContextToken)
 }
 
 // ReplyItems sends a reply with custom message items.
 func (c *Context) ReplyItems(items []MessageItem) error {
 	msg := newBotMsg(c.Message.FromUserID, c.Message.ContextToken, items)
-	return sendRaw(c.Ctx, c.bot.c, c.bot.cfg.channelVersion, msg)
+	return sendRaw(c.Ctx, c.bot.c, c.bot.cfg.channelVersion, c.bot.cfg.botAgent, msg)
 }
 
 // Typing sends a "typing" indicator to the sender.

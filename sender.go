@@ -24,10 +24,10 @@ func newBotMsg(toUserID, contextToken string, items []MessageItem) *Message {
 	}
 }
 
-func sendRaw(ctx context.Context, c *client, channelVersion string, msg *Message) error {
+func sendRaw(ctx context.Context, c *client, channelVersion, botAgent string, msg *Message) error {
 	req := &SendMessageRequest{
 		Msg:      msg,
-		BaseInfo: &BaseInfo{ChannelVersion: channelVersion},
+		BaseInfo: &BaseInfo{ChannelVersion: channelVersion, BotAgent: botAgent},
 	}
 	var resp SendMessageResponse
 	if err := c.post(ctx, "/ilink/bot/sendmessage", req, &resp); err != nil {
@@ -40,41 +40,41 @@ func sendRaw(ctx context.Context, c *client, channelVersion string, msg *Message
 }
 
 // SendText sends a plain-text message.
-func sendText(ctx context.Context, c *client, channelVersion, toUserID, text, contextToken string) error {
+func sendText(ctx context.Context, c *client, channelVersion, botAgent, toUserID, text, contextToken string) error {
 	msg := newBotMsg(toUserID, contextToken, []MessageItem{
 		{Type: ItemTypeText, TextItem: &TextItem{Text: text}},
 	})
-	return sendRaw(ctx, c, channelVersion, msg)
+	return sendRaw(ctx, c, channelVersion, botAgent, msg)
 }
 
 // sendImage sends an image message.
-func sendImage(ctx context.Context, c *client, channelVersion, toUserID, contextToken string, img *ImageItem) error {
+func sendImage(ctx context.Context, c *client, channelVersion, botAgent, toUserID, contextToken string, img *ImageItem) error {
 	msg := newBotMsg(toUserID, contextToken, []MessageItem{
 		{Type: ItemTypeImage, ImageItem: img},
 	})
-	return sendRaw(ctx, c, channelVersion, msg)
+	return sendRaw(ctx, c, channelVersion, botAgent, msg)
 }
 
 // sendVoice sends a voice message.
-func sendVoice(ctx context.Context, c *client, channelVersion, toUserID, contextToken string, voice *VoiceItem) error {
+func sendVoice(ctx context.Context, c *client, channelVersion, botAgent, toUserID, contextToken string, voice *VoiceItem) error {
 	msg := newBotMsg(toUserID, contextToken, []MessageItem{
 		{Type: ItemTypeVoice, VoiceItem: voice},
 	})
-	return sendRaw(ctx, c, channelVersion, msg)
+	return sendRaw(ctx, c, channelVersion, botAgent, msg)
 }
 
 // sendFile sends a file message.
-func sendFile(ctx context.Context, c *client, channelVersion, toUserID, contextToken string, file *FileItem) error {
+func sendFile(ctx context.Context, c *client, channelVersion, botAgent, toUserID, contextToken string, file *FileItem) error {
 	msg := newBotMsg(toUserID, contextToken, []MessageItem{
 		{Type: ItemTypeFile, FileItem: file},
 	})
-	return sendRaw(ctx, c, channelVersion, msg)
+	return sendRaw(ctx, c, channelVersion, botAgent, msg)
 }
 
 // sendVideo sends a video message.
-func sendVideo(ctx context.Context, c *client, channelVersion, toUserID, contextToken string, video *VideoItem) error {
+func sendVideo(ctx context.Context, c *client, channelVersion, botAgent, toUserID, contextToken string, video *VideoItem) error {
 	msg := newBotMsg(toUserID, contextToken, []MessageItem{
 		{Type: ItemTypeVideo, VideoItem: video},
 	})
-	return sendRaw(ctx, c, channelVersion, msg)
+	return sendRaw(ctx, c, channelVersion, botAgent, msg)
 }

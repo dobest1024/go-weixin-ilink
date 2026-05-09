@@ -42,7 +42,7 @@ func NewBot(opts ...Option) *Bot {
 		o(cfg)
 	}
 
-	c := newClient(cfg.baseURL, cfg.httpClient, cfg.channelVersion)
+	c := newClient(cfg.baseURL, cfg.httpClient, cfg.channelVersion, cfg.appID)
 
 	var tokenStore TokenStore
 	if cfg.tokenStore != nil {
@@ -75,8 +75,8 @@ func NewBot(opts ...Option) *Bot {
 		cfg:        cfg,
 		c:          c,
 		authSvc:    newAuth(c, tokenStore, cfg.logger),
-		typing:     newTypingManager(c, cfg.logger),
-		media:      newMediaManager(c, cfg.httpClient, cfg.cdnBaseURL, cfg.channelVersion, cfg.logger),
+		typing:     newTypingManager(c, cfg.logger, cfg.botAgent),
+		media:      newMediaManager(c, cfg.httpClient, cfg.cdnBaseURL, cfg.channelVersion, cfg.botAgent, cfg.logger),
 		dispatcher: newDispatcher(),
 		ctxStore:   ctxStore,
 	}
@@ -96,6 +96,12 @@ func (b *Bot) Login(ctx context.Context, onQR QRCallback) error {
 	return nil
 }
 
+// Resume restores the session from stored credentials without validation or QR login.
+// Returns nil if credentials were loaded, or ErrNoStoredCredentials if no token exists.
+func (b *Bot) Resume() error {
+	return b.authSvc.Resume()
+}
+
 // Run starts the message-polling loop. Blocks until ctx is cancelled.
 // Session expiry (-14) is handled automatically: the poller pauses 1 hour then retries.
 // Must call Login before Run.
@@ -103,8 +109,13 @@ func (b *Bot) Run(ctx context.Context) error {
 	if b.c.getToken() == "" {
 		return ErrNotLoggedIn
 	}
+
+	if err := notifyStart(ctx, b.c, b.baseInfo()); err != nil {
+		b.cfg.logger.Warn("notifyStart failed (ignored)", "error", err)
+	}
+
 	b.polling = newPoller(b.c, b.handleMessage, b.cfg.channelVersion, b.cfg.logger,
-		b.cfg.syncBufStore, b.cfg.maxWorkers, &b.cfg.hooks)
+		b.cfg.syncBufStore, b.cfg.maxWorkers, &b.cfg.hooks, b.cfg.botAgent)
 	err := b.polling.Run(ctx)
 	b.cfg.hooks.callOnBotStop(err)
 	return err
@@ -112,6 +123,9 @@ func (b *Bot) Run(ctx context.Context) error {
 
 // Stop gracefully stops the polling loop and waits for in-flight handlers.
 func (b *Bot) Stop() {
+	if err := notifyStop(context.Background(), b.c, b.baseInfo()); err != nil {
+		b.cfg.logger.Warn("notifyStop failed (ignored)", "error", err)
+	}
 	if b.polling != nil {
 		b.polling.Stop()
 	}
@@ -212,7 +226,7 @@ func (b *Bot) SendText(ctx context.Context, userID, text string) error {
 	if token == "" {
 		return ErrNoContextToken
 	}
-	return sendText(ctx, b.c, b.cfg.channelVersion, userID, text, token)
+	return sendText(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, text, token)
 }
 
 // SendImage sends an image message to userID.
@@ -224,7 +238,7 @@ func (b *Bot) SendImage(ctx context.Context, userID string, img *ImageItem) erro
 	if token == "" {
 		return ErrNoContextToken
 	}
-	return sendImage(ctx, b.c, b.cfg.channelVersion, userID, token, img)
+	return sendImage(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, token, img)
 }
 
 // SendVoice sends a voice message to userID.
@@ -236,7 +250,7 @@ func (b *Bot) SendVoice(ctx context.Context, userID string, voice *VoiceItem) er
 	if token == "" {
 		return ErrNoContextToken
 	}
-	return sendVoice(ctx, b.c, b.cfg.channelVersion, userID, token, voice)
+	return sendVoice(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, token, voice)
 }
 
 // SendFile sends a file message to userID.
@@ -248,7 +262,7 @@ func (b *Bot) SendFile(ctx context.Context, userID string, file *FileItem) error
 	if token == "" {
 		return ErrNoContextToken
 	}
-	return sendFile(ctx, b.c, b.cfg.channelVersion, userID, token, file)
+	return sendFile(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, token, file)
 }
 
 // SendVideo sends a video message to userID.
@@ -260,7 +274,7 @@ func (b *Bot) SendVideo(ctx context.Context, userID string, video *VideoItem) er
 	if token == "" {
 		return ErrNoContextToken
 	}
-	return sendVideo(ctx, b.c, b.cfg.channelVersion, userID, token, video)
+	return sendVideo(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, token, video)
 }
 
 // ─── Media ────────────────────────────────────────────────────────────────────
@@ -324,6 +338,14 @@ func (b *Bot) ClearContextToken(userID string) error {
 
 // Logger returns the configured logger.
 func (b *Bot) Logger() *slog.Logger { return b.cfg.logger }
+
+// baseInfo builds the BaseInfo payload for API requests.
+func (b *Bot) baseInfo() *BaseInfo {
+	return &BaseInfo{
+		ChannelVersion: b.cfg.channelVersion,
+		BotAgent:       b.cfg.botAgent,
+	}
+}
 
 // ─── Internal ────────────────────────────────────────────────────────────────
 

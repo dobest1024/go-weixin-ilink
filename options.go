@@ -8,7 +8,7 @@ import (
 const (
 	defaultBaseURL         = "https://ilinkai.weixin.qq.com"
 	defaultCDNBaseURL      = "https://novac2c.cdn.weixin.qq.com/c2c"
-	defaultChannelVersion  = "1.0.3"
+	defaultChannelVersion  = "2.4.3"
 	defaultTokenFile       = ".ilink-token.json"
 	defaultContextTokenDir = ".ilink-context-tokens"
 )
@@ -17,6 +17,8 @@ type config struct {
 	baseURL           string
 	cdnBaseURL        string
 	channelVersion    string
+	appID             string
+	botAgent          string
 	tokenFile         string
 	contextTokenDir   string
 	syncBufFile       string
@@ -121,4 +123,15 @@ func WithMaxWorkers(n int) Option {
 // WithHooks sets lifecycle hooks for the bot.
 func WithHooks(h Hooks) Option {
 	return func(c *config) { c.hooks = h }
+}
+
+// WithAppID sets the iLink-App-Id header value sent with every API request.
+func WithAppID(id string) Option {
+	return func(c *config) { c.appID = id }
+}
+
+// WithBotAgent sets the bot_agent field in BaseInfo.
+// Format: UA-style "Name/Version" tokens (ASCII only, max 256 bytes).
+func WithBotAgent(agent string) Option {
+	return func(c *config) { c.botAgent = agent }
 }

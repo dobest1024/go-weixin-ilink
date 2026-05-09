@@ -129,16 +129,17 @@ func (b *Bot) LoginAsync(ctx context.Context) (*QRSession, error) {
 				a.c.setBaseURL(baseURL)
 			}
 			a.logger.Info("validating stored credentials...")
-			if valid, _ := a.validate(ctx); valid {
+			if valid, vErr := a.validate(ctx); valid {
 				a.logger.Info("reusing stored credentials")
 				b.cfg.hooks.callOnLogin()
 				sess := &QRSession{doneCh: make(chan struct{})}
 				sess.finish(LoginStatusConfirmed, nil)
 				return sess, nil
-			}
-			a.logger.Info("stored credentials invalid, re-login required")
-			if a.store != nil {
+			} else if IsSessionExpired(vErr) {
+				a.logger.Info("stored credentials expired, re-login required")
 				_ = a.store.Clear()
+			} else {
+				a.logger.Warn("credential validation failed (transient), re-login required", "error", vErr)
 			}
 		}
 	}

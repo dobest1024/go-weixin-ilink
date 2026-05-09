@@ -58,13 +58,15 @@ func (a *auth) Login(ctx context.Context, onQR QRCallback) error {
 				a.c.setBaseURL(baseURL)
 			}
 			a.logger.Info("validating stored credentials...")
-			if valid, _ := a.validate(ctx); valid {
+			if valid, vErr := a.validate(ctx); valid {
 				a.logger.Info("reusing stored credentials")
 				return nil
-			}
-			a.logger.Info("stored credentials invalid, re-login required")
-			if a.store != nil {
+			} else if IsSessionExpired(vErr) {
+				a.logger.Info("stored credentials expired, re-login required")
 				_ = a.store.Clear()
+			} else {
+				// Network timeout or transient error — keep token, but proceed to QR
+				a.logger.Warn("credential validation failed (transient), re-login required", "error", vErr)
 			}
 		}
 	}
@@ -106,6 +108,30 @@ func (a *auth) Login(ctx context.Context, onQR QRCallback) error {
 		}
 	}
 	return ErrQRCodeExpired
+}
+
+// Resume restores a session from stored credentials without validation.
+// It loads the token and baseURL from the store and sets them on the client.
+// No API call is made — the poller's Run loop will detect invalid tokens
+// (e.g., session expired -14) and handle them automatically.
+// Returns ErrNoStoredCredentials if no token is stored.
+func (a *auth) Resume() error {
+	if a.store == nil {
+		return ErrNoStoredCredentials
+	}
+	token, baseURL, err := a.store.Load()
+	if err != nil {
+		return fmt.Errorf("load stored credentials: %w", err)
+	}
+	if token == "" {
+		return ErrNoStoredCredentials
+	}
+	a.c.setToken(token)
+	if baseURL != "" {
+		a.c.setBaseURL(baseURL)
+	}
+	a.logger.Info("restored credentials from store")
+	return nil
 }
 
 // validate checks current credentials via a lightweight getupdates call.
