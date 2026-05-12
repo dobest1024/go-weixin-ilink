@@ -31,6 +31,13 @@ type config struct {
 	// Concurrency: max goroutines for message handling; 0 = serial (default).
 	maxWorkers int
 
+	// SKRouteTag is an optional routing hint header sent with every API request.
+	skRouteTag string
+
+	// AllowFrom restricts message processing to listed user IDs.
+	// nil/empty = accept all messages.
+	allowFrom map[string]struct{}
+
 	// Lifecycle hooks
 	hooks Hooks
 }
@@ -134,4 +141,22 @@ func WithAppID(id string) Option {
 // Format: UA-style "Name/Version" tokens (ASCII only, max 256 bytes).
 func WithBotAgent(agent string) Option {
 	return func(c *config) { c.botAgent = agent }
+}
+
+// WithSKRouteTag sets the SKRouteTag header value sent with every API request.
+// This is an optional routing hint used by the iLink backend infrastructure.
+func WithSKRouteTag(tag string) Option {
+	return func(c *config) { c.skRouteTag = tag }
+}
+
+// WithAllowFrom restricts the bot to only process messages from the listed
+// user IDs. When the list is empty (default), all messages are accepted.
+// Messages from unlisted senders are silently dropped before dispatch.
+func WithAllowFrom(userIDs ...string) Option {
+	return func(c *config) {
+		c.allowFrom = make(map[string]struct{}, len(userIDs))
+		for _, id := range userIDs {
+			c.allowFrom[id] = struct{}{}
+		}
+	}
 }

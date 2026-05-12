@@ -24,15 +24,17 @@ type client struct {
 	channelVersion string
 	appID          string
 	clientVersion  string // "iLink-App-ClientVersion" computed from channelVersion
+	skRouteTag     string
 }
 
-func newClient(baseURL string, httpClient *http.Client, channelVersion, appID string) *client {
+func newClient(baseURL string, httpClient *http.Client, channelVersion, appID, skRouteTag string) *client {
 	return &client{
 		baseURL:        baseURL,
 		httpClient:     httpClient,
 		channelVersion: channelVersion,
 		appID:          appID,
 		clientVersion:  buildClientVersion(channelVersion),
+		skRouteTag:     skRouteTag,
 	}
 }
 
@@ -108,6 +110,9 @@ func (c *client) do(ctx context.Context, method, path string, body, result inter
 	}
 	if c.clientVersion != "" {
 		req.Header.Set("iLink-App-ClientVersion", c.clientVersion)
+	}
+	if c.skRouteTag != "" {
+		req.Header.Set("SKRouteTag", c.skRouteTag)
 	}
 	if token := c.getToken(); token != "" {
 		req.Header.Set("Authorization", "Bearer "+token)

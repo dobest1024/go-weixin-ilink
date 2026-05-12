@@ -42,7 +42,7 @@ func NewBot(opts ...Option) *Bot {
 		o(cfg)
 	}
 
-	c := newClient(cfg.baseURL, cfg.httpClient, cfg.channelVersion, cfg.appID)
+	c := newClient(cfg.baseURL, cfg.httpClient, cfg.channelVersion, cfg.appID, cfg.skRouteTag)
 
 	var tokenStore TokenStore
 	if cfg.tokenStore != nil {
@@ -352,6 +352,15 @@ func (b *Bot) baseInfo() *BaseInfo {
 // handleMessage is the internal messageHandler passed to the poller.
 // It persists the context token and dispatches to registered handlers.
 func (b *Bot) handleMessage(ctx context.Context, msg *Message) error {
+	// AllowFrom filtering: if configured, only accept messages from listed users.
+	if len(b.cfg.allowFrom) > 0 {
+		if _, ok := b.cfg.allowFrom[msg.FromUserID]; !ok {
+			b.cfg.logger.Debug("message dropped: sender not in allowFrom",
+				"from_user_id", msg.FromUserID)
+			return nil
+		}
+	}
+
 	// Persist context token for later proactive sends
 	if msg.ContextToken != "" && msg.FromUserID != "" {
 		if err := b.ctxStore.Save(msg.FromUserID, msg.ContextToken); err != nil {
