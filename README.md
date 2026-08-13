@@ -203,6 +203,17 @@ go-weixin-ilink/
 
 ---
 
+## 版本
+
+遵循[语义化版本](https://semver.org/lang/zh-CN/)。`v0.x` 阶段 API 仍可能调整，
+破坏性变更会在 minor 版本发布并记录在 [CHANGELOG](CHANGELOG.md)。
+
+```bash
+go get github.com/dobest1024/go-weixin-ilink@latest
+```
+
+---
+
 ## License
 
 [MIT](LICENSE) © 2026 Gundy
