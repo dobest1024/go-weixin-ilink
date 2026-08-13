@@ -51,7 +51,9 @@ func main() {
 				logger.Info("✅ [Hook] 登录成功")
 			},
 			OnSessionExpired: func() {
-				logger.Warn("⚠️ [Hook] 会话过期，自动暂停 1 小时后重试")
+				// 此刻 SDK 已冻结全部 API 调用：批量推送、发送队列都会立即
+				// 返回 *SessionPausedError，不会拿失效 token 空转。
+				logger.Warn("⚠️ [Hook] token 失效，已冻结全部调用，1 小时后重试")
 				// 实际场景：通知管理员、更新数据库状态
 			},
 			OnSessionRecovered: func() {
@@ -66,6 +68,17 @@ func main() {
 			OnHandlerPanic: func(recovered any, msg *ilink.Message) {
 				logger.Error("💥 [Hook] handler panic",
 					"panic", recovered, "from", msg.FromUserID)
+			},
+
+			// 出站拦截：所有外发消息（含批量推送、发送队列）都会经过。
+			OnBeforeSend: func(msg *ilink.Message) error {
+				logger.Debug("📤 [Hook] 准备发送", "to", msg.ToUserID, "run_id", msg.RunID)
+				return nil
+			},
+			OnAfterSend: func(msg *ilink.Message, err error) {
+				if err != nil {
+					logger.Warn("📤 [Hook] 发送失败", "to", msg.ToUserID, "error", err)
+				}
 			},
 		}),
 	)
@@ -198,9 +211,21 @@ func main() {
 				return
 			case <-ticker.C:
 				s := session.Status()
-				if s != lastStatus {
-					logger.Info("登录状态变更", "status", s)
-					lastStatus = s
+				if s == lastStatus {
+					continue
+				}
+				lastStatus = s
+				logger.Info("登录状态变更", "status", s)
+				switch s {
+				case ilink.LoginStatusNeedVerifyCode:
+					// 默认从 stdin 读；接 Web 时用 WithVerifyCodeFunc 换成表单，
+					// 见 examples/webapp。
+					logger.Info("服务端要求输入配对码")
+				case ilink.LoginStatusPending:
+					// 二维码过期后 SDK 会自动换新，这里重新渲染。
+					if qr := session.QRImage(); qr != "" {
+						ilink.TerminalQR(qr)
+					}
 				}
 			}
 		}
@@ -211,9 +236,11 @@ func main() {
 		ilink.TerminalQR(qr)
 	}
 
-	// 等待登录完成
+	// 等待登录完成。
+	// 若返回 ErrAlreadyBound，说明该 bot 已连接过本客户端但本地凭证丢失，
+	// 删掉 token 文件重新扫码即可。
 	if err := session.Wait(ctx); err != nil {
-		log.Fatalf("登录失败: %v", err)
+		log.Fatalf("登录失败: %v (status=%s)", err, session.Status())
 	}
 	logger.Info("登录完成，启动 Bot")
 

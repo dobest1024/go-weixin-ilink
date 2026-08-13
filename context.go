@@ -184,10 +184,42 @@ func (c *Context) StopTyping() error {
 
 // --- Media helpers (delegate to Bot) ---
 
+// Bot returns the Bot handling this message, for the APIs that have no
+// Context shortcut (proactive sends to other users, BotManager lookups, ...).
+func (c *Context) Bot() *Bot { return c.bot }
+
 // Upload encrypts and uploads raw bytes to WeChat CDN.
 // fileType: "image" | "video" | "voice" | "file"
 func (c *Context) Upload(data []byte, fileType string) (*UploadResult, error) {
 	return c.bot.Upload(c.Ctx, data, c.Message.FromUserID, fileType)
+}
+
+// UploadWithOptions uploads raw bytes with a thumbnail, so the recipient sees a
+// preview before the full file arrives.
+func (c *Context) UploadWithOptions(data []byte, opts UploadOptions) (*UploadResult, error) {
+	return c.bot.UploadWithOptions(c.Ctx, data, c.Message.FromUserID, opts)
+}
+
+// DownloadVoice downloads and decrypts an inbound voice message, returning the
+// payload and its detected MIME type.
+//
+// Check VoiceItem.Text first: the server usually attaches a transcript, and
+// reading it costs nothing compared to downloading and decoding the audio.
+func (c *Context) DownloadVoice(voice *VoiceItem) ([]byte, string, error) {
+	return c.bot.DownloadVoice(c.Ctx, voice)
+}
+
+// DownloadVoiceWAV downloads an inbound voice message and converts it to WAV
+// using the configured VoiceTranscoder. Returns ErrNoVoiceTranscoder when the
+// payload is SILK and no transcoder is set — see WithVoiceTranscoder.
+func (c *Context) DownloadVoiceWAV(voice *VoiceItem) ([]byte, error) {
+	return c.bot.DownloadVoiceWAV(c.Ctx, voice)
+}
+
+// DownloadFile downloads and decrypts an inbound file attachment, returning the
+// bytes and the MIME type inferred from the file name.
+func (c *Context) DownloadFile(file *FileItem) ([]byte, string, error) {
+	return c.bot.DownloadFile(c.Ctx, file)
 }
 
 // DownloadImage downloads and decrypts an inbound image message.

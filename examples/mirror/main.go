@@ -9,6 +9,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -29,18 +30,14 @@ func main() {
 		ilink.WithSyncBufFile(".mirror-syncbuf"),
 	)
 
-	// ── 文本 ──────────────────────────────────────────────────────────────────
-	bot.OnText(func(ctx *ilink.Context) {
-		logger.Info("收到文本", "from", ctx.UserID(), "text", ctx.Text(),
-			"has_quote", ctx.HasQuote(), "quoted_text", ctx.QuotedText())
+	// ── 文本 / 语音转写 ───────────────────────────────────────────────────────
+	// OnBody 而不是 OnText：Body() 已经把引用上下文拼好、语音回落到转写文本，
+	// 不用再手工拼 "[引用: ...]"。
+	bot.OnBody(func(ctx *ilink.Context) {
+		logger.Info("收到正文", "from", ctx.UserID(), "body", ctx.Body(),
+			"has_quote", ctx.HasQuote())
 
-		var reply string
-		if ctx.HasQuote() {
-			reply = fmt.Sprintf("[引用: %s]\n%s", ctx.QuotedText(), ctx.Text())
-		} else {
-			reply = ctx.Text()
-		}
-		if err := ctx.ReplyText(reply); err != nil {
+		if err := ctx.ReplyText(ctx.Body()); err != nil {
 			logger.Error("回复文本失败", "error", err)
 		}
 	})
@@ -59,15 +56,23 @@ func main() {
 		}
 		logger.Info("图片下载完成", "bytes", len(data))
 
-		// 2. 上传（重新加密）
-		result, err := ctx.Upload(data, "image")
+		// 2. 上传（重新加密）。带上缩略图，接收方在原图下载完成前就有预览。
+		//    缩略图与原图共用同一个 AES key；缩略图上传失败不影响主图，
+		//    只是退化成无预览。
+		result, err := ctx.UploadWithOptions(data, ilink.UploadOptions{
+			FileType:    "image",
+			Thumb:       makeThumb(data),
+			ThumbWidth:  img.ThumbWidth,
+			ThumbHeight: img.ThumbHeight,
+		})
 		if err != nil {
 			logger.Error("上传图片失败", "error", err)
 			ctx.ReplyText(fmt.Sprintf("上传图片失败：%v", err))
 			return
 		}
+		logger.Info("图片上传完成", "has_thumb", result.HasThumb())
 
-		// 3. 发回
+		// 3. 发回。BuildImageItem 会自动带上缩略图（如果有）。
 		if err := ctx.ReplyItems([]ilink.MessageItem{ilink.BuildImageItem(result)}); err != nil {
 			logger.Error("发送图片失败", "error", err)
 		}
@@ -90,15 +95,21 @@ func main() {
 			"media_encrypt_type", encType,
 		)
 
-		// 1. 下载
-		data, err := ctx.DownloadMedia(voice.Media)
+		// 服务端通常已经带了转写文本，此时不必解码音频。
+		// 需要 WAV 时配 ilink.WithVoiceTranscoder 后用 bot.DownloadVoiceWAV。
+		if voice.Text != "" {
+			logger.Info("语音已转写，无需解码", "text", voice.Text)
+		}
+
+		// 1. 下载。DownloadVoice 会顺带识别负载类型（SILK / WAV / MP3）。
+		data, mime, err := ctx.DownloadVoice(voice)
 		if err != nil {
 			logger.Error("下载语音失败", "error", err)
 			ctx.ReplyText(fmt.Sprintf("下载语音失败：%v", err))
 			return
 		}
-		logger.Info("语音下载完成", "bytes", len(data),
-			"header_hex", fmt.Sprintf("%x", data[:min(16, len(data))]))
+		logger.Info("语音下载完成", "bytes", len(data), "mime", mime,
+			"is_silk", ilink.IsSilk(data))
 
 		// 2. 上传
 		result, err := ctx.Upload(data, "voice")
@@ -176,15 +187,20 @@ func main() {
 		}
 		logger.Info("视频下载完成", "bytes", len(data))
 
-		// 2. 上传
-		result, err := ctx.Upload(data, "video")
+		// 2. 上传，带缩略图（真实场景里用 ffmpeg 抽第一帧）。
+		result, err := ctx.UploadWithOptions(data, ilink.UploadOptions{
+			FileType:    "video",
+			Thumb:       makeThumb(data),
+			ThumbWidth:  video.ThumbWidth,
+			ThumbHeight: video.ThumbHeight,
+		})
 		if err != nil {
 			logger.Error("上传视频失败", "error", err)
 			ctx.ReplyText(fmt.Sprintf("上传视频失败：%v", err))
 			return
 		}
 
-		// 3. 发回（保留时长和分辨率）
+		// 3. 发回（保留时长和分辨率，缩略图自动附带）
 		if err := ctx.ReplyItems([]ilink.MessageItem{
 			ilink.BuildVideoItem(result, video.ThumbWidth, video.ThumbHeight, video.PlayLength),
 		}); err != nil {
@@ -201,8 +217,16 @@ func main() {
 	defer stop()
 
 	logger.Info("Mirror bot 已启动，发什么还你什么")
-	if err := bot.Run(ctx); err != nil && err != context.Canceled {
+	if err := bot.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("bot 异常退出: %v", err)
 	}
 	logger.Info("bot 已停止")
+}
+
+// makeThumb 是缩略图生成的占位实现。
+//
+// 真实场景里：图片用 image/jpeg 缩放，视频用 ffmpeg 抽第一帧。这里返回 nil，
+// UploadWithOptions 会走无缩略图路径 —— 也就是和以前一样的行为。
+func makeThumb(_ []byte) []byte {
+	return nil
 }

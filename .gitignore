@@ -10,9 +10,6 @@
 *.syncbuf
 *-syncbuf
 
-# Docs scratch
-docs/
-
 # IDE
 .idea/
 .vscode/
@@ -24,3 +21,6 @@ docs/
 /mirror
 /echo
 /ai_bot
+/ai_agent
+/middleware
+/webapp

@@ -1,9 +1,18 @@
-// AI bot skeleton: shows middleware, typing indicators, and per-user rate limiting.
-// Replace callAI() with your actual AI API call (e.g. Claude, OpenAI).
+// AI bot 骨架：中间件、打字状态、按用户限流
+//
+// 只做「一问一答」。需要工具调用进度、run_id 归组的完整 agent 回合，
+// 见 examples/ai_agent。
+//
+// 把 callAI() 换成真实的模型调用（Claude / OpenAI / 自建）。
+//
+// 运行：
+//
+//	go run ./examples/ai_bot
 package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"log/slog"
@@ -25,49 +34,61 @@ func main() {
 		ilink.WithContextTokenDir(".ai-bot-ctx"),
 	)
 
-	// Global middleware: log every message.
-	bot.Use(func(ctx *ilink.Context) {
-		logger.Info("message received",
-			"user_id", ctx.UserID(),
-			"is_group", ctx.IsGroup(),
-			"text", ctx.Text(),
-		)
-		ctx.Next()
-	})
+	bot.Use(
+		// 记录进入时间，供 /echo 和 debug 模式统计耗时。
+		ilink.Timing(),
 
-	// Rate limiter middleware (max 1 message per 2 seconds per user).
-	bot.Use(rateLimiter(2 * time.Second))
+		// 全局日志。用 Body() 而不是 Text()，语音转写也能记下来。
+		func(ctx *ilink.Context) {
+			logger.Info("message received",
+				"user_id", ctx.UserID(),
+				"is_group", ctx.IsGroup(),
+				"body", ctx.Body(),
+			)
+			ctx.Next()
+		},
 
-	// /help command.
-	bot.OnTextPrefix("/help", func(ctx *ilink.Context) {
-		_ = ctx.ReplyText("Commands:\n/help — show this message\n/ping — test connectivity\n(anything else) — AI reply")
-	})
+		// 按用户限流：每 2 秒最多一条。
+		rateLimiter(2*time.Second),
 
-	// /ping command.
-	bot.OnTextPrefix("/ping", func(ctx *ilink.Context) {
-		_ = ctx.ReplyText("pong 🏓")
-	})
+		// 内置 /echo、/toggle-debug，外加自定义指令。
+		// 命中指令会中止整条链，不会流到下面的 AI handler。
+		ilink.SlashCommands(ilink.SlashCommandOptions{
+			Commands: map[string]ilink.SlashCommandFunc{
+				"/help": func(c *ilink.Context, _ string) error {
+					return c.ReplyText("可用指令：\n" +
+						"/help — 显示本说明\n" +
+						"/ping — 连通性测试\n" +
+						"/echo <文本> — 回显并显示通道耗时\n" +
+						"/toggle-debug — 开关耗时统计\n" +
+						"（其他内容）— AI 回复")
+				},
+				"/ping": func(c *ilink.Context, _ string) error {
+					return c.ReplyText("pong 🏓")
+				},
+			},
+		}),
+	)
 
-	// All other text → AI reply.
-	bot.OnText(func(ctx *ilink.Context) {
-		// Show typing indicator while processing.
+	// 非指令消息 → AI 回复。
+	bot.OnBody(func(ctx *ilink.Context) {
+		// 处理期间显示「对方正在输入」。
 		_ = ctx.Typing()
 		defer func() { _ = ctx.StopTyping() }()
 
-		reply, err := callAI(ctx.Ctx, ctx.UserID(), ctx.Text())
+		reply, err := callAI(ctx.Ctx, ctx.UserID(), ctx.Body())
 		if err != nil {
 			logger.Error("AI call failed", "error", err)
-			_ = ctx.ReplyText("Sorry, I encountered an error. Please try again.")
+			_ = ctx.ReplyText("抱歉，出错了，请稍后再试。")
 			return
+		}
+		if ctx.DebugEnabled() {
+			reply += fmt.Sprintf("\n\n⏱ 耗时 %dms", time.Since(ctx.ReceivedAt()).Milliseconds())
 		}
 		_ = ctx.ReplyText(reply)
 	})
 
-	// Login.
-	loginCtx, loginCancel := context.WithCancel(context.Background())
-	defer loginCancel()
-
-	if err := bot.Login(loginCtx, ilink.TerminalQR); err != nil {
+	if err := bot.Login(context.Background(), ilink.TerminalQR); err != nil {
 		log.Fatalf("login failed: %v", err)
 	}
 
@@ -75,18 +96,17 @@ func main() {
 	defer stop()
 
 	logger.Info("AI bot started")
-	if err := bot.Run(ctx); err != nil && err != context.Canceled {
+	if err := bot.Run(ctx); err != nil && !errors.Is(err, context.Canceled) {
 		log.Fatalf("bot stopped: %v", err)
 	}
 }
 
-// callAI is a placeholder — replace with your actual AI API integration.
+// callAI 是占位实现，换成你真实的模型调用。
 func callAI(_ context.Context, userID, text string) (string, error) {
-	// Example: return an echo reply with the user ID.
-	return fmt.Sprintf("[AI response for %s]: %s", userID, text), nil
+	return fmt.Sprintf("[AI 回复 %s]：%s", userID, text), nil
 }
 
-// rateLimiter returns a middleware that throttles messages per user.
+// rateLimiter 返回一个按用户限流的中间件。
 func rateLimiter(interval time.Duration) ilink.HandlerFunc {
 	var mu sync.Mutex
 	lastSeen := make(map[string]time.Time)
@@ -97,7 +117,7 @@ func rateLimiter(interval time.Duration) ilink.HandlerFunc {
 		now := time.Now()
 		if ok && now.Sub(last) < interval {
 			mu.Unlock()
-			_ = ctx.ReplyText("Please slow down — one message at a time.")
+			_ = ctx.ReplyText("发得太快了，一条一条来。")
 			ctx.Abort()
 			return
 		}
