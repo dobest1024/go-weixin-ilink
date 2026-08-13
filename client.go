@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"math/big"
 	"net/http"
 	"strconv"
@@ -21,16 +22,22 @@ type client struct {
 	baseURL        string
 	token          string
 	httpClient     *http.Client
+	logger         *slog.Logger
 	channelVersion string
 	appID          string
 	clientVersion  string // "iLink-App-ClientVersion" computed from channelVersion
 	skRouteTag     string
+
+	// guard suppresses every API call for an hour after a stale-token response,
+	// so proactive sends stop hammering a token the server already rejected.
+	guard sessionGuard
 }
 
-func newClient(baseURL string, httpClient *http.Client, channelVersion, appID, skRouteTag string) *client {
+func newClient(baseURL string, httpClient *http.Client, channelVersion, appID, skRouteTag string, logger *slog.Logger) *client {
 	return &client{
 		baseURL:        baseURL,
 		httpClient:     httpClient,
+		logger:         logger,
 		channelVersion: channelVersion,
 		appID:          appID,
 		clientVersion:  buildClientVersion(channelVersion),
@@ -86,51 +93,119 @@ func generateUIN() string {
 	return base64.StdEncoding.EncodeToString([]byte(n.String()))
 }
 
-func (c *client) do(ctx context.Context, method, path string, body, result interface{}) error {
+// commonHeaders are sent with every request, authenticated or not.
+func (c *client) commonHeaders(h http.Header) {
+	if c.appID != "" {
+		h.Set("iLink-App-Id", c.appID)
+	}
+	if c.clientVersion != "" {
+		h.Set("iLink-App-ClientVersion", c.clientVersion)
+	}
+	if c.skRouteTag != "" {
+		h.Set("SKRouteTag", c.skRouteTag)
+	}
+}
+
+// postHeaders add the JSON body headers and, unless anonymous, the bearer
+// token. They are only sent on POST: the pre-login GET endpoints take the
+// common headers alone.
+func (c *client) postHeaders(h http.Header, anonymous bool) {
+	h.Set("Content-Type", "application/json")
+	h.Set("AuthorizationType", "ilink_bot_token")
+	h.Set("X-WECHAT-UIN", generateUIN())
+	if anonymous {
+		return
+	}
+	if token := c.getToken(); token != "" {
+		h.Set("Authorization", "Bearer "+token)
+	}
+}
+
+// request describes one API call. baseURL overrides the client's current base
+// URL, which the QR login flow needs when the server redirects it to another IDC.
+type request struct {
+	method  string
+	baseURL string
+	path    string
+	body    interface{}
+	result  interface{}
+
+	// skipGuard lets the poller and the login flow through while the
+	// stale-token cooldown is active.
+	skipGuard bool
+
+	// anonymous omits the Authorization header. The login endpoints are
+	// pre-authentication: presenting the stale token we are trying to replace
+	// makes the server answer for the old session instead of issuing a new one.
+	anonymous bool
+}
+
+func (c *client) do(ctx context.Context, r request) error {
+	if !r.skipGuard {
+		if err := c.guard.check(); err != nil {
+			return err
+		}
+	}
+
 	var bodyReader io.Reader
-	if body != nil {
-		data, err := json.Marshal(body)
+	var rawBody []byte
+	if r.body != nil {
+		data, err := json.Marshal(r.body)
 		if err != nil {
 			return fmt.Errorf("marshal request: %w", err)
 		}
+		rawBody = data
 		bodyReader = bytes.NewReader(data)
 	}
 
-	url := c.getBaseURL() + path
-	req, err := http.NewRequestWithContext(ctx, method, url, bodyReader)
+	base := r.baseURL
+	if base == "" {
+		base = c.getBaseURL()
+	}
+	url := strings.TrimSuffix(base, "/") + r.path
+
+	req, err := http.NewRequestWithContext(ctx, r.method, url, bodyReader)
 	if err != nil {
 		return fmt.Errorf("create request: %w", err)
 	}
 
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("AuthorizationType", "ilink_bot_token")
-	req.Header.Set("X-WECHAT-UIN", generateUIN())
-	if c.appID != "" {
-		req.Header.Set("iLink-App-Id", c.appID)
+	c.commonHeaders(req.Header)
+	if r.method == http.MethodPost {
+		c.postHeaders(req.Header, r.anonymous)
 	}
-	if c.clientVersion != "" {
-		req.Header.Set("iLink-App-ClientVersion", c.clientVersion)
-	}
-	if c.skRouteTag != "" {
-		req.Header.Set("SKRouteTag", c.skRouteTag)
-	}
-	if token := c.getToken(); token != "" {
-		req.Header.Set("Authorization", "Bearer "+token)
+
+	if c.logger != nil {
+		c.logger.Debug("api request", "method", r.method, "url", RedactURL(url),
+			"body", RedactBody(string(rawBody)))
 	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("http %s %s: %w", method, path, err)
+		netErr := ClassifyNetError(err)
+		if c.logger != nil {
+			args := append([]any{"method", r.method, "url", RedactURL(url), "error", err}, netErr.LogArgs()...)
+			c.logger.Error("api request failed", args...)
+		}
+		return fmt.Errorf("http %s %s (%s): %w", r.method, r.path, netErr, err)
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		b, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("http %d: %s", resp.StatusCode, string(b))
+	respBody, readErr := io.ReadAll(resp.Body)
+	if readErr != nil {
+		return fmt.Errorf("read response: %w", readErr)
 	}
 
-	if result != nil {
-		if err := json.NewDecoder(resp.Body).Decode(result); err != nil {
+	if c.logger != nil {
+		c.logger.Debug("api response", "url", RedactURL(url),
+			"status", resp.StatusCode, "body", RedactBody(string(respBody)))
+	}
+
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("http %d: %s", resp.StatusCode, RedactBody(string(respBody)))
+	}
+
+	if r.result != nil {
+		if err := json.Unmarshal(respBody, r.result); err != nil {
 			return fmt.Errorf("decode response: %w", err)
 		}
 	}
@@ -138,11 +213,11 @@ func (c *client) do(ctx context.Context, method, path string, body, result inter
 }
 
 func (c *client) get(ctx context.Context, path string, result interface{}) error {
-	return c.do(ctx, http.MethodGet, path, nil, result)
+	return c.do(ctx, request{method: http.MethodGet, path: path, result: result})
 }
 
 func (c *client) post(ctx context.Context, path string, body, result interface{}) error {
-	return c.do(ctx, http.MethodPost, path, body, result)
+	return c.do(ctx, request{method: http.MethodPost, path: path, body: body, result: result})
 }
 
 // httpDo performs a raw HTTP request (used by media upload/download without iLink headers).

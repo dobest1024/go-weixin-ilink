@@ -8,8 +8,6 @@ import (
 // HandlerFunc handles a dispatched message.
 type HandlerFunc func(*Context)
 
-const abortIndex = int8(127)
-
 // Context wraps an incoming message and provides reply helpers.
 // It also implements the middleware chain via Next/Abort.
 type Context struct {
@@ -22,9 +20,13 @@ type Context struct {
 	// bot gives access to send/media capabilities.
 	bot *Bot
 
-	// middleware chain
+	// middleware chain.
+	// aborted is a flag rather than a sentinel index: the previous int8
+	// sentinel (127) overflowed to -128 on Next's trailing increment and
+	// indexed the handler slice out of range.
 	handlers []HandlerFunc
-	index    int8
+	index    int
+	aborted  bool
 
 	// per-request KV store
 	mu   sync.RWMutex
@@ -44,20 +46,23 @@ func newContext(ctx context.Context, msg *Message, bot *Bot, handlers []HandlerF
 // Next executes the next handler in the chain.
 func (c *Context) Next() {
 	c.index++
-	for c.index < int8(len(c.handlers)) {
+	for c.index < len(c.handlers) {
 		c.handlers[c.index](c)
+		if c.aborted {
+			return
+		}
 		c.index++
 	}
 }
 
 // Abort stops the handler chain after the current handler returns.
 func (c *Context) Abort() {
-	c.index = abortIndex
+	c.aborted = true
 }
 
 // IsAborted reports whether the chain was aborted.
 func (c *Context) IsAborted() bool {
-	return c.index >= abortIndex
+	return c.aborted
 }
 
 // Set stores a value in the per-request context.
@@ -91,6 +96,30 @@ func (c *Context) MustGet(key string) any {
 
 // Text returns the text content of the message (empty string if not a text message).
 func (c *Context) Text() string { return c.Message.Text() }
+
+// Body returns the message rendered the way a chat client shows it: a quoted
+// message becomes a "[引用: …]" prefix, and a voice message falls back to its
+// speech-to-text transcript. This is what you should feed to an AI pipeline —
+// Text alone drops voice input on the floor.
+func (c *Context) Body() string { return c.Message.BodyText() }
+
+// RunID returns the run ID to tag outbound messages with. It defaults to the
+// inbound message's run_id and can be overridden with SetRunID.
+func (c *Context) RunID() string {
+	if v, ok := c.Get(runIDKey); ok {
+		if s, ok := v.(string); ok {
+			return s
+		}
+	}
+	return c.Message.RunID
+}
+
+// SetRunID overrides the run ID used for every subsequent reply from this
+// context, grouping them into one bubble on the client.
+func (c *Context) SetRunID(runID string) { c.Set(runIDKey, runID) }
+
+// runIDKey is the per-request key holding an overridden run ID.
+const runIDKey = "ilink.run_id"
 
 // QuotedText returns the text content of the quoted (ref_msg) item, if any.
 // Returns empty string when there is no quoted message or the quote contains no text.
@@ -127,16 +156,20 @@ func (c *Context) IsPrivate() bool { return c.Message.IsPrivate() }
 
 // --- Reply helpers ---
 
+// sender returns the send parameters for this message, carrying the run ID so
+// every reply is grouped with the run that produced it.
+func (c *Context) sender() sendParams {
+	return c.bot.sender().withRunID(c.RunID())
+}
+
 // ReplyText sends a text reply to the message sender.
 func (c *Context) ReplyText(text string) error {
-	return sendText(c.Ctx, c.bot.c, c.bot.cfg.channelVersion, c.bot.cfg.botAgent,
-		c.Message.FromUserID, text, c.Message.ContextToken)
+	return c.sender().text(c.Ctx, c.Message.FromUserID, c.Message.ContextToken, text)
 }
 
 // ReplyItems sends a reply with custom message items.
 func (c *Context) ReplyItems(items []MessageItem) error {
-	msg := newBotMsg(c.Message.FromUserID, c.Message.ContextToken, items)
-	return sendRaw(c.Ctx, c.bot.c, c.bot.cfg.channelVersion, c.bot.cfg.botAgent, msg)
+	return c.sender().items(c.Ctx, c.Message.FromUserID, c.Message.ContextToken, items)
 }
 
 // Typing sends a "typing" indicator to the sender.

@@ -19,6 +19,10 @@ type SyncBufStore interface {
 // FileSyncBufStore persists the cursor to a single file.
 type FileSyncBufStore struct {
 	path string
+	// fallbacks are legacy locations read (never written) when path is absent,
+	// so a bot that moves its state directory resumes instead of replaying
+	// every message the server still holds.
+	fallbacks []string
 }
 
 // NewFileSyncBufStore creates a FileSyncBufStore at the given path.
@@ -26,19 +30,37 @@ func NewFileSyncBufStore(path string) *FileSyncBufStore {
 	return &FileSyncBufStore{path: path}
 }
 
+// NewFileSyncBufStoreWithFallback creates a store that writes to path but, on a
+// cold start, reads the first readable fallback when path does not yet exist.
+// Use it when changing where the cursor lives: pass the old paths as fallbacks
+// and the next Save migrates the value to the new location.
+func NewFileSyncBufStoreWithFallback(path string, fallbacks ...string) *FileSyncBufStore {
+	return &FileSyncBufStore{path: path, fallbacks: fallbacks}
+}
+
 func (f *FileSyncBufStore) Save(buf string) error {
+	if dir := filepath.Dir(f.path); dir != "" && dir != "." {
+		if err := os.MkdirAll(dir, 0700); err != nil {
+			return fmt.Errorf("create sync buf dir: %w", err)
+		}
+	}
 	return os.WriteFile(f.path, []byte(buf), 0600)
 }
 
 func (f *FileSyncBufStore) Load() (string, error) {
 	data, err := os.ReadFile(f.path)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return "", nil
-		}
+	if err == nil {
+		return string(data), nil
+	}
+	if !os.IsNotExist(err) {
 		return "", err
 	}
-	return string(data), nil
+	for _, p := range f.fallbacks {
+		if data, fbErr := os.ReadFile(p); fbErr == nil {
+			return string(data), nil
+		}
+	}
+	return "", nil
 }
 
 // TokenStore persists the bot_token across restarts.
@@ -145,9 +167,9 @@ type ctxTokenEntry struct {
 // FileContextTokenStore persists per-user context tokens to a directory.
 // One JSON file per user: {dir}/{userID}.json
 type FileContextTokenStore struct {
-	dir    string
-	mu     sync.RWMutex
-	cache  map[string]string
+	dir   string
+	mu    sync.RWMutex
+	cache map[string]string
 }
 
 // NewFileContextTokenStore creates (or opens) the directory for storing context tokens.

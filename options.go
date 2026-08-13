@@ -6,9 +6,13 @@ import (
 )
 
 const (
-	defaultBaseURL         = "https://ilinkai.weixin.qq.com"
-	defaultCDNBaseURL      = "https://novac2c.cdn.weixin.qq.com/c2c"
-	defaultChannelVersion  = "2.4.3"
+	defaultBaseURL        = "https://ilinkai.weixin.qq.com"
+	defaultCDNBaseURL     = "https://novac2c.cdn.weixin.qq.com/c2c"
+	defaultChannelVersion = "2.4.6"
+	// defaultAppID is the iLink-App-Id header value. The server rejects or
+	// mis-routes requests that omit it, so it must never default to empty.
+	defaultAppID           = "bot"
+	defaultBotType         = "3"
 	defaultTokenFile       = ".ilink-token.json"
 	defaultContextTokenDir = ".ilink-context-tokens"
 )
@@ -34,6 +38,19 @@ type config struct {
 	// SKRouteTag is an optional routing hint header sent with every API request.
 	skRouteTag string
 
+	// botType selects which QR code flavour to request (get_bot_qrcode?bot_type=).
+	botType string
+
+	// verifyCode supplies the pair code when the server challenges a QR scan.
+	verifyCode VerifyCodeFunc
+
+	// localTokens lists bot_tokens already held locally, sent with the QR
+	// request so the server can recognise an already-bound bot.
+	localTokens func() []string
+
+	// voiceTranscoder converts inbound SILK voice payloads to WAV.
+	voiceTranscoder VoiceTranscoder
+
 	// AllowFrom restricts message processing to listed user IDs.
 	// nil/empty = accept all messages.
 	allowFrom map[string]struct{}
@@ -47,10 +64,13 @@ func defaultConfig() *config {
 		baseURL:         defaultBaseURL,
 		cdnBaseURL:      defaultCDNBaseURL,
 		channelVersion:  defaultChannelVersion,
+		appID:           defaultAppID,
+		botType:         defaultBotType,
 		tokenFile:       defaultTokenFile,
 		contextTokenDir: defaultContextTokenDir,
 		httpClient:      &http.Client{},
 		logger:          slog.Default(),
+		verifyCode:      TerminalVerifyCode,
 	}
 }
 
@@ -147,6 +167,40 @@ func WithBotAgent(agent string) Option {
 // This is an optional routing hint used by the iLink backend infrastructure.
 func WithSKRouteTag(tag string) Option {
 	return func(c *config) { c.skRouteTag = tag }
+}
+
+// WithBotType sets the bot_type query parameter used when requesting a login
+// QR code. Defaults to "3".
+func WithBotType(t string) Option {
+	return func(c *config) { c.botType = t }
+}
+
+// WithVerifyCodeFunc sets the callback used when the server challenges a QR
+// scan and asks for the pair code shown on the user's phone.
+//
+// The callback receives retry=true when a previously submitted code was
+// rejected. Return an error to abort the login. Defaults to TerminalVerifyCode,
+// which prompts on stdin; pass nil to fail fast instead (ErrNoVerifyCodeFunc).
+func WithVerifyCodeFunc(f VerifyCodeFunc) Option {
+	return func(c *config) { c.verifyCode = f }
+}
+
+// WithLocalTokens supplies the bot_tokens already stored on this machine. They
+// are sent with the QR request so the server can detect a bot that is already
+// bound to this client and answer "already connected" instead of issuing a
+// duplicate session. At most 10 tokens are sent.
+//
+// By default the SDK sends the single token held by the configured TokenStore.
+// Override this when you manage several bots through a BotManager.
+func WithLocalTokens(f func() []string) Option {
+	return func(c *config) { c.localTokens = f }
+}
+
+// WithVoiceTranscoder installs a SILK-to-WAV converter used by
+// Context.VoiceWAV and Bot.DownloadVoiceWAV. Without one, inbound voice bytes
+// are returned in their original SILK encoding.
+func WithVoiceTranscoder(t VoiceTranscoder) Option {
+	return func(c *config) { c.voiceTranscoder = t }
 }
 
 // WithAllowFrom restricts the bot to only process messages from the listed

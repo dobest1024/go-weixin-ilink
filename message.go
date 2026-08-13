@@ -1,5 +1,7 @@
 package ilink
 
+import "strings"
+
 // MessageType indicates who sent the message.
 type MessageType int
 
@@ -27,7 +29,31 @@ const (
 	ItemTypeVoice ItemType = 3
 	ItemTypeFile  ItemType = 4
 	ItemTypeVideo ItemType = 5
+
+	// ItemTypeToolCallStart announces that the bot began executing a tool, so
+	// the user sees progress instead of silence during a long run.
+	ItemTypeToolCallStart ItemType = 11
+	// ItemTypeToolCallResult reports the outcome of a tool call.
+	ItemTypeToolCallResult ItemType = 12
 )
+
+// Tool call status values carried by ToolCallResultItem.Status.
+const (
+	ToolCallStatusCompleted = "completed"
+	ToolCallStatusFailed    = "failed"
+	ToolCallStatusBlocked   = "blocked"
+	ToolCallStatusUnknown   = "unknown"
+)
+
+// NormalizeToolCallStatus maps an arbitrary status string onto the values the
+// iLink client understands, falling back to ToolCallStatusUnknown.
+func NormalizeToolCallStatus(status string) string {
+	switch status {
+	case ToolCallStatusCompleted, ToolCallStatusFailed, ToolCallStatusBlocked:
+		return status
+	}
+	return ToolCallStatusUnknown
+}
 
 // Message represents a WeChat iLink message.
 type Message struct {
@@ -45,6 +71,11 @@ type Message struct {
 	UpdateTimeMs int64         `json:"update_time_ms,omitempty"`
 	DeleteTimeMs int64         `json:"delete_time_ms,omitempty"`
 	ItemList     []MessageItem `json:"item_list,omitempty"`
+
+	// RunID ties every outbound message produced by one agent run together —
+	// tool-call progress items, intermediate text, and the final reply. The
+	// client uses it to group them into a single bubble.
+	RunID string `json:"run_id,omitempty"`
 }
 
 // IsFromUser reports whether this message was sent by a user (not a bot).
@@ -68,6 +99,69 @@ func (m *Message) Text() string {
 
 // IsText reports whether the message contains a text item.
 func (m *Message) IsText() bool { return m.Text() != "" }
+
+// VoiceText returns the speech-to-text transcript the server attaches to voice
+// messages, or empty string when absent.
+func (m *Message) VoiceText() string {
+	if v := m.GetVoiceItem(); v != nil {
+		return v.Text
+	}
+	return ""
+}
+
+// BodyText renders the message the way a chat client would show it, and is what
+// you should feed to an AI pipeline:
+//
+//   - a quoted message becomes a "[引用: …]" prefix ahead of the new text;
+//   - a voice message falls back to its speech-to-text transcript, so voice
+//     input reaches the model as text;
+//   - quoted media is skipped, since the attachment travels separately.
+//
+// Returns empty string for a message with no textual content at all.
+func (m *Message) BodyText() string {
+	for i := range m.ItemList {
+		item := &m.ItemList[i]
+		if item.Type == ItemTypeText && item.TextItem != nil {
+			text := item.TextItem.Text
+			ref := item.RefMsg
+			if ref == nil {
+				return text
+			}
+			// Quoted media is delivered as a separate attachment; only the new
+			// text belongs in the body.
+			if ref.MessageItem != nil && ref.MessageItem.IsMedia() {
+				return text
+			}
+			var parts []string
+			if ref.Title != "" {
+				parts = append(parts, ref.Title)
+			}
+			if ref.MessageItem != nil && ref.MessageItem.TextItem != nil && ref.MessageItem.TextItem.Text != "" {
+				parts = append(parts, ref.MessageItem.TextItem.Text)
+			}
+			if len(parts) == 0 {
+				return text
+			}
+			return "[引用: " + strings.Join(parts, " | ") + "]\n" + text
+		}
+		if item.Type == ItemTypeVoice && item.VoiceItem != nil && item.VoiceItem.Text != "" {
+			return item.VoiceItem.Text
+		}
+	}
+	return ""
+}
+
+// HasBodyText reports whether BodyText would return a non-empty string.
+func (m *Message) HasBodyText() bool { return m.BodyText() != "" }
+
+// IsMedia reports whether the item carries a downloadable attachment.
+func (it *MessageItem) IsMedia() bool {
+	switch it.Type {
+	case ItemTypeImage, ItemTypeVideo, ItemTypeFile, ItemTypeVoice:
+		return true
+	}
+	return false
+}
 
 // IsImage reports whether the message contains an image.
 func (m *Message) IsImage() bool { return m.GetImageItem() != nil }
@@ -129,17 +223,34 @@ type RefMessage struct {
 
 // MessageItem is a single content element within a message.
 type MessageItem struct {
-	Type         ItemType     `json:"type"`
-	MsgID        string       `json:"msg_id,omitempty"`
-	CreateTimeMs int64        `json:"create_time_ms,omitempty"`
-	UpdateTimeMs int64        `json:"update_time_ms,omitempty"`
-	IsCompleted  bool         `json:"is_completed,omitempty"`
-	RefMsg       *RefMessage  `json:"ref_msg,omitempty"`
-	TextItem     *TextItem    `json:"text_item,omitempty"`
-	ImageItem    *ImageItem   `json:"image_item,omitempty"`
-	VoiceItem    *VoiceItem   `json:"voice_item,omitempty"`
-	FileItem     *FileItem    `json:"file_item,omitempty"`
-	VideoItem    *VideoItem   `json:"video_item,omitempty"`
+	Type         ItemType    `json:"type"`
+	MsgID        string      `json:"msg_id,omitempty"`
+	CreateTimeMs int64       `json:"create_time_ms,omitempty"`
+	UpdateTimeMs int64       `json:"update_time_ms,omitempty"`
+	IsCompleted  bool        `json:"is_completed,omitempty"`
+	RefMsg       *RefMessage `json:"ref_msg,omitempty"`
+	TextItem     *TextItem   `json:"text_item,omitempty"`
+	ImageItem    *ImageItem  `json:"image_item,omitempty"`
+	VoiceItem    *VoiceItem  `json:"voice_item,omitempty"`
+	FileItem     *FileItem   `json:"file_item,omitempty"`
+	VideoItem    *VideoItem  `json:"video_item,omitempty"`
+
+	ToolCallStartItem  *ToolCallStartItem  `json:"tool_call_start_item,omitempty"`
+	ToolCallResultItem *ToolCallResultItem `json:"tool_call_result_item,omitempty"`
+}
+
+// ToolCallStartItem announces that the bot started executing a named tool.
+type ToolCallStartItem struct {
+	ToolName   string `json:"tool_name,omitempty"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+}
+
+// ToolCallResultItem reports the outcome of a tool call. Status is one of the
+// ToolCallStatus* constants.
+type ToolCallResultItem struct {
+	ToolName   string `json:"tool_name,omitempty"`
+	ToolCallID string `json:"tool_call_id,omitempty"`
+	Status     string `json:"status,omitempty"`
 }
 
 // TextItem carries plain text content.
@@ -211,6 +322,15 @@ type BaseInfo struct {
 type GetUpdatesRequest struct {
 	GetUpdatesBuf string    `json:"get_updates_buf"`
 	BaseInfo      *BaseInfo `json:"base_info,omitempty"`
+}
+
+// Code returns the effective error code, reading ret first and falling back to
+// errcode, since the server populates either field depending on the CGI.
+func (r *GetUpdatesResponse) Code() int {
+	if r.Ret != 0 {
+		return r.Ret
+	}
+	return r.ErrCode
 }
 
 // GetUpdatesResponse is the response from POST /ilink/bot/getupdates.

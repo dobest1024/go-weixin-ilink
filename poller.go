@@ -4,7 +4,7 @@ import (
 	"context"
 	"errors"
 	"log/slog"
-	"net"
+	"net/http"
 	"sync"
 	"time"
 )
@@ -104,8 +104,12 @@ func (p *poller) Run(ctx context.Context) error {
 				return ErrPollerStopped
 			}
 			if IsSessionExpired(err) {
+				// Suppress *every* API call for the cooldown, not just polling:
+				// proactive sends and uploads share the same rejected token.
+				until := p.c.guard.pause(sessionPauseDur)
 				p.hooks.callOnSessionExpired()
-				p.logger.Error("session expired, pausing for 1 hour before retry", "error", err)
+				p.logger.Error("stale token, pausing all API calls",
+					"errcode", StaleTokenErrCode, "until", until, "error", err)
 				wasExpired = true
 				select {
 				case <-ctx.Done():
@@ -114,14 +118,15 @@ func (p *poller) Run(ctx context.Context) error {
 					return ErrPollerStopped
 				case <-time.After(sessionPauseDur):
 				}
+				p.c.guard.resume()
 				consecFails = 0
 				continue
 			}
 
-			var netErr net.Error
-			isTimeout := errors.Is(err, context.DeadlineExceeded) ||
-				(errors.As(err, &netErr) && netErr.Timeout())
-			if isTimeout {
+			// Classifying the transport failure turns "poll error: ..." into an
+			// actionable line: DNS, refused connection, TLS, or a real timeout.
+			cls := ClassifyNetError(err)
+			if cls.Type == NetErrTimeout {
 				p.logger.Debug("poll timeout (normal), reconnecting")
 				consecFails = 0
 				continue
@@ -129,7 +134,8 @@ func (p *poller) Run(ctx context.Context) error {
 
 			consecFails++
 			p.hooks.callOnError(err)
-			p.logger.Warn("poll error", "error", err, "consecutive_fails", consecFails)
+			p.logger.Warn("poll error",
+				append([]any{"error", err, "consecutive_fails", consecFails}, cls.LogArgs()...)...)
 			if consecFails >= maxConsecFails {
 				p.logger.Info("backing off", "delay", backoffDelay)
 				select {
@@ -213,16 +219,20 @@ func (p *poller) poll(ctx context.Context) (*GetUpdatesResponse, error) {
 		BaseInfo:      &BaseInfo{ChannelVersion: p.channelVersion, BotAgent: p.botAgent},
 	}
 	var resp GetUpdatesResponse
-	if err := p.c.post(ctx, "/ilink/bot/getupdates", req, &resp); err != nil {
+	// The poller drives the cooldown itself, so it must not be blocked by it.
+	err := p.c.do(ctx, request{
+		method:    http.MethodPost,
+		path:      "/ilink/bot/getupdates",
+		body:      req,
+		result:    &resp,
+		skipGuard: true,
+	})
+	if err != nil {
 		return nil, err
 	}
-	// Check both ret and errcode — official SDK reports errors via either field.
-	code := resp.Ret
-	if code == 0 {
-		code = resp.ErrCode
-	}
-	if code != 0 {
-		return nil, &APIError{Code: code, Message: resp.ErrMsg}
+	// Check both ret and errcode — the server reports errors via either field.
+	if apiErr := apiError(resp.Ret, resp.ErrCode, resp.ErrMsg); apiErr != nil {
+		return nil, apiErr
 	}
 	return &resp, nil
 }

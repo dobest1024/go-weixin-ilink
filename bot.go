@@ -42,7 +42,7 @@ func NewBot(opts ...Option) *Bot {
 		o(cfg)
 	}
 
-	c := newClient(cfg.baseURL, cfg.httpClient, cfg.channelVersion, cfg.appID, cfg.skRouteTag)
+	c := newClient(cfg.baseURL, cfg.httpClient, cfg.channelVersion, cfg.appID, cfg.skRouteTag, cfg.logger)
 
 	var tokenStore TokenStore
 	if cfg.tokenStore != nil {
@@ -74,12 +74,36 @@ func NewBot(opts ...Option) *Bot {
 	return &Bot{
 		cfg:        cfg,
 		c:          c,
-		authSvc:    newAuth(c, tokenStore, cfg.logger),
+		authSvc:    newAuth(c, tokenStore, cfg.logger, cfg),
 		typing:     newTypingManager(c, cfg.logger, cfg.botAgent),
 		media:      newMediaManager(c, cfg.httpClient, cfg.cdnBaseURL, cfg.channelVersion, cfg.botAgent, cfg.logger),
 		dispatcher: newDispatcher(),
 		ctxStore:   ctxStore,
 	}
+}
+
+// sender builds the send parameters shared by every outbound path.
+func (b *Bot) sender() sendParams {
+	return sendParams{
+		c:              b.c,
+		channelVersion: b.cfg.channelVersion,
+		botAgent:       b.cfg.botAgent,
+		hooks:          &b.cfg.hooks,
+		logger:         b.cfg.logger,
+	}
+}
+
+// contextTokenFor loads a user's context token, which every outbound message
+// must carry.
+func (b *Bot) contextTokenFor(userID string) (string, error) {
+	token, err := b.ctxStore.Load(userID)
+	if err != nil {
+		return "", fmt.Errorf("load context token: %w", err)
+	}
+	if token == "" {
+		return "", ErrNoContextToken
+	}
+	return token, nil
 }
 
 // ─── Lifecycle ───────────────────────────────────────────────────────────────
@@ -209,6 +233,14 @@ func (b *Bot) OnGroupID(groupID string, handlers ...HandlerFunc) {
 	b.dispatcher.add(matchGroupID(groupID), handlers...)
 }
 
+// OnBody registers handlers for any message that carries readable text, which
+// includes a voice message the server transcribed. Prefer it over OnText for an
+// AI pipeline: OnText only fires for literal text items, so voice input never
+// reaches the model. Read the content with Context.Body.
+func (b *Bot) OnBody(handlers ...HandlerFunc) {
+	b.dispatcher.add(matchBodyText(), handlers...)
+}
+
 // OnUserID registers handlers for messages from a specific user.
 func (b *Bot) OnUserID(userID string, handlers ...HandlerFunc) {
 	b.dispatcher.add(matchUserID(userID), handlers...)
@@ -219,62 +251,66 @@ func (b *Bot) OnUserID(userID string, handlers ...HandlerFunc) {
 // SendText sends a text message to userID using the stored context token.
 // Returns ErrNoContextToken if no context token has been stored for the user.
 func (b *Bot) SendText(ctx context.Context, userID, text string) error {
-	token, err := b.ctxStore.Load(userID)
+	token, err := b.contextTokenFor(userID)
 	if err != nil {
-		return fmt.Errorf("load context token: %w", err)
+		return err
 	}
-	if token == "" {
-		return ErrNoContextToken
-	}
-	return sendText(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, text, token)
+	return b.sender().text(ctx, userID, token, text)
 }
 
 // SendImage sends an image message to userID.
 func (b *Bot) SendImage(ctx context.Context, userID string, img *ImageItem) error {
-	token, err := b.ctxStore.Load(userID)
+	token, err := b.contextTokenFor(userID)
 	if err != nil {
-		return fmt.Errorf("load context token: %w", err)
+		return err
 	}
-	if token == "" {
-		return ErrNoContextToken
-	}
-	return sendImage(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, token, img)
+	return b.sender().image(ctx, userID, token, img)
 }
 
 // SendVoice sends a voice message to userID.
 func (b *Bot) SendVoice(ctx context.Context, userID string, voice *VoiceItem) error {
-	token, err := b.ctxStore.Load(userID)
+	token, err := b.contextTokenFor(userID)
 	if err != nil {
-		return fmt.Errorf("load context token: %w", err)
+		return err
 	}
-	if token == "" {
-		return ErrNoContextToken
-	}
-	return sendVoice(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, token, voice)
+	return b.sender().voice(ctx, userID, token, voice)
 }
 
 // SendFile sends a file message to userID.
 func (b *Bot) SendFile(ctx context.Context, userID string, file *FileItem) error {
-	token, err := b.ctxStore.Load(userID)
+	token, err := b.contextTokenFor(userID)
 	if err != nil {
-		return fmt.Errorf("load context token: %w", err)
+		return err
 	}
-	if token == "" {
-		return ErrNoContextToken
-	}
-	return sendFile(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, token, file)
+	return b.sender().file(ctx, userID, token, file)
 }
 
 // SendVideo sends a video message to userID.
 func (b *Bot) SendVideo(ctx context.Context, userID string, video *VideoItem) error {
-	token, err := b.ctxStore.Load(userID)
+	token, err := b.contextTokenFor(userID)
 	if err != nil {
-		return fmt.Errorf("load context token: %w", err)
+		return err
 	}
-	if token == "" {
-		return ErrNoContextToken
+	return b.sender().video(ctx, userID, token, video)
+}
+
+// SendItems sends a message with custom content items to userID.
+func (b *Bot) SendItems(ctx context.Context, userID string, items []MessageItem) error {
+	token, err := b.contextTokenFor(userID)
+	if err != nil {
+		return err
 	}
-	return sendVideo(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, userID, token, video)
+	return b.sender().items(ctx, userID, token, items)
+}
+
+// SendTextRun is SendText tagged with a run ID, so the client groups this
+// message with the rest of the same agent run.
+func (b *Bot) SendTextRun(ctx context.Context, userID, text, runID string) error {
+	token, err := b.contextTokenFor(userID)
+	if err != nil {
+		return err
+	}
+	return b.sender().withRunID(runID).text(ctx, userID, token, text)
 }
 
 // ─── Media ────────────────────────────────────────────────────────────────────
@@ -284,6 +320,12 @@ func (b *Bot) SendVideo(ctx context.Context, userID string, video *VideoItem) er
 // toUserID: the intended recipient (required by the upload URL API).
 func (b *Bot) Upload(ctx context.Context, data []byte, toUserID, fileType string) (*UploadResult, error) {
 	return b.media.UploadFile(ctx, data, toUserID, fileType)
+}
+
+// UploadWithOptions encrypts and uploads raw bytes, optionally with a
+// thumbnail so the recipient sees a preview before the full file arrives.
+func (b *Bot) UploadWithOptions(ctx context.Context, data []byte, toUserID string, opts UploadOptions) (*UploadResult, error) {
+	return b.media.Upload(ctx, data, toUserID, opts)
 }
 
 // Download downloads and decrypts a CDN media file.
@@ -314,6 +356,77 @@ func (b *Bot) DownloadImage(ctx context.Context, img *ImageItem) ([]byte, error)
 		return b.media.DownloadFile(ctx, cdnURL, img.AESKey)
 	}
 	return b.media.DownloadFileWithBase64Key(ctx, cdnURL, img.Media.AESKey)
+}
+
+// DownloadVoice downloads and decrypts an inbound voice message, returning the
+// raw payload (usually SILK) and its detected MIME type.
+func (b *Bot) DownloadVoice(ctx context.Context, voice *VoiceItem) ([]byte, string, error) {
+	if voice == nil || voice.Media == nil {
+		return nil, "", fmt.Errorf("ilink: voice item has no media")
+	}
+	cdnURL := b.media.BuildDownloadURL(voice.Media)
+
+	var data []byte
+	var err error
+	if voice.Media.AESKey != "" {
+		data, err = b.media.DownloadFileWithBase64Key(ctx, cdnURL, voice.Media.AESKey)
+	} else {
+		// No key means the payload is not encrypted; decrypting it would corrupt it.
+		data, err = b.media.DownloadPlain(ctx, cdnURL)
+	}
+	if err != nil {
+		return nil, "", err
+	}
+
+	mime := DetectMIME(data)
+	if mime == "" {
+		mime = "audio/silk"
+	}
+	return data, mime, nil
+}
+
+// DownloadVoiceWAV downloads an inbound voice message and converts it to WAV
+// using the configured VoiceTranscoder.
+//
+// Returns ErrNoVoiceTranscoder when the payload is SILK and no transcoder is
+// configured — see WithVoiceTranscoder. Payloads that are already WAV or MP3
+// are returned untouched.
+func (b *Bot) DownloadVoiceWAV(ctx context.Context, voice *VoiceItem) ([]byte, error) {
+	data, mime, err := b.DownloadVoice(ctx, voice)
+	if err != nil {
+		return nil, err
+	}
+	if !IsSilk(data) {
+		b.cfg.logger.Debug("voice payload is not SILK, returning as-is", "mime", mime)
+		return data, nil
+	}
+	if b.cfg.voiceTranscoder == nil {
+		return nil, ErrNoVoiceTranscoder
+	}
+	sampleRate := voice.SampleRate
+	if sampleRate <= 0 {
+		sampleRate = DefaultVoiceSampleRate
+	}
+	return b.cfg.voiceTranscoder.ToWAV(StripSilkPrefix(data), sampleRate)
+}
+
+// DownloadFile downloads and decrypts an inbound file attachment, returning the
+// bytes and the MIME type inferred from the file name.
+func (b *Bot) DownloadFile(ctx context.Context, file *FileItem) ([]byte, string, error) {
+	if file == nil || file.Media == nil {
+		return nil, "", fmt.Errorf("ilink: file item has no media")
+	}
+	data, err := b.DownloadMedia(ctx, file.Media)
+	if err != nil {
+		return nil, "", err
+	}
+	mime := MIMEFromFilename(file.FileName)
+	if mime == DefaultMIME {
+		if sniffed := DetectMIME(data); sniffed != "" {
+			mime = sniffed
+		}
+	}
+	return data, mime, nil
 }
 
 // CDNBaseURL returns the configured CDN base URL (useful for building download URLs manually).

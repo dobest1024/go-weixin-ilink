@@ -32,11 +32,17 @@ bot.Run(context.Background())
 - **多 Bot 管理**：`BotManager` 统一管理多个 Bot 实例的创建/启动/停止
 - **批量推送**：`BatchSendText()` 并发群发，`SendQueue` 带限速的发送队列
 - **引用消息**：`ctx.HasQuote()` / `ctx.QuotedText()` 读取用户长按回复的内容
-- **媒体收发**：CDN 文件上传/下载，AES-128-ECB 自动加解密，支持图片/语音/文件/视频
-- **打字状态**：`ctx.Typing()` / `ctx.StopTyping()`，typing_ticket 按用户自动缓存 24 小时
+- **消息正文渲染**：`ctx.Body()` 自动拼接引用上下文、回落到语音转写文本，直接喂给 AI
+- **工具调用进度**：`ctx.ToolProgress()` 推送 "正在调用 xxx"，长工具调用不再是一片空白
+- **出站 Hook**：`OnBeforeSend` 可改写/取消每一条外发消息，`OnAfterSend` 观测投递结果
+- **斜杠指令**：`ilink.SlashCommands()` 中间件内置 `/echo`、`/toggle-debug`，可注册自定义指令
+- **媒体收发**：CDN 文件上传/下载，AES-128-ECB 自动加解密，支持图片/语音/文件/视频/缩略图
+- **打字状态**：`ctx.Typing()` / `ctx.StopTyping()`，typing_ticket 按用户缓存并带退避重试
 - **断点续传**：`get_updates_buf` 写盘，重启后从上次位置继续拉消息，不重复处理历史
 - **凭证持久化**：扫码登录后 token 写文件，重启免扫码
-- **会话自愈**：检测到 session 过期（-14）后自动暂停 1 小时重试，无需手动重启
+- **完整扫码状态机**：配对码校验、IDC 重定向、已绑定识别、二维码自动刷新
+- **会话自愈**：token 失效（-14）后**冻结全部 API 调用**并暂停 1 小时重试，主动推送不再空转
+- **网络错误分类**：`ClassifyNetError` 区分 DNS / TCP / TLS / 超时，日志自动脱敏
 - **优雅关闭**：监听 context 取消，等待 in-flight handler 处理完毕
 - **Panic 隔离**：单条消息崩溃不影响整体轮询
 
@@ -61,10 +67,16 @@ go get github.com/dobest1024/go-weixin-ilink
 - [并发处理](#并发处理)
 - [生命周期 Hook](#生命周期-hook)
 - [异步 QR 登录](#异步-qr-登录)
+- [登录状态机与配对码](#登录状态机与配对码)
+- [工具调用进度](#工具调用进度)
+- [出站 Hook](#出站-hook)
+- [斜杠指令与调试](#斜杠指令与调试)
+- [语音转写与转码](#语音转写与转码)
 - [多 Bot 管理](#多-bot-管理)
 - [批量推送与发送队列](#批量推送与发送队列)
 - [存储接口](#存储接口)
 - [错误处理](#错误处理)
+- [可观测性](#可观测性)
 - [完整示例](#完整示例)
 
 ---
@@ -123,7 +135,23 @@ bot := ilink.NewBot(
     ilink.WithHTTPClient(myHTTPClient),           // 自定义 HTTP Client（不要设置 Timeout）
     ilink.WithBaseURL("https://ilinkai.weixin.qq.com"),              // API 地址，一般无需修改
     ilink.WithCDNBaseURL("https://novac2c.cdn.weixin.qq.com/c2c"),   // 媒体 CDN 地址
-    ilink.WithChannelVersion("1.0.3"),            // 协议版本
+    ilink.WithChannelVersion("2.4.6"),            // 协议版本，默认对齐官方插件
+    ilink.WithAppID("bot"),                       // iLink-App-Id 头，默认 "bot"
+    ilink.WithBotAgent("MyBot/1.0"),              // UA 风格自述标识，随每个请求上报
+    ilink.WithSKRouteTag("gray"),                 // 可选路由提示头
+    ilink.WithMaxWorkers(8),                      // 并发处理消息，默认 0（串行）
+    ilink.WithAllowFrom("user-a", "user-b"),      // 白名单，只处理这些用户的消息
+)
+```
+
+登录与媒体相关：
+
+```go
+bot := ilink.NewBot(
+    ilink.WithBotType("3"),                       // 二维码类型，默认 "3"
+    ilink.WithVerifyCodeFunc(myPairCodePrompt),   // 配对码输入，默认从 stdin 读
+    ilink.WithLocalTokens(myTokenPool),           // 上报本地已有 token，识别已绑定的 bot
+    ilink.WithVoiceTranscoder(mySilkDecoder),     // SILK → WAV 转码器
 )
 ```
 
@@ -229,10 +257,12 @@ bot.Use(func(ctx *ilink.Context) {
 ### 访问消息内容
 
 ```go
-ctx.Text()       // 文本内容，非文本消息返回 ""
+ctx.Text()       // 字面文本 item 的内容，非文本消息返回 ""
+ctx.Body()       // 渲染后的正文：拼接引用上下文 + 回落到语音转写，喂 AI 用这个
 ctx.UserID()     // 发送者 user ID
 ctx.IsGroup()    // 是否群消息
 ctx.IsPrivate()  // 是否私聊
+ctx.RunID()      // 本轮 agent 运行的 run_id
 ctx.Message      // 原始 *ilink.Message，含完整协议字段
 
 // 引用/回复消息（用户长按消息引用时）
@@ -256,7 +286,18 @@ msg.CreateTimeMs  // 消息创建时间（毫秒时间戳）
 msg.SessionID     // 会话 ID
 msg.GroupID       // 群组 ID（私聊为空）
 msg.ContextToken  // 当前用户的 context_token
+msg.RunID         // 一轮 agent 运行的分组 ID
 ```
+
+`Text()` 和 `Body()` 的区别：
+
+| 消息 | `Text()` | `Body()` |
+|---|---|---|
+| 纯文本「你好」 | `你好` | `你好` |
+| 引用「服务器 500 了」并问「怎么修」 | `怎么修` | `[引用: 张三 \| 服务器 500 了]\n怎么修` |
+| 语音（服务端转写为「查天气」） | `""` | `查天气` |
+
+对应的路由：`OnText` 只匹配前两种，`OnBody` 三种都匹配。
 
 ### 请求级别 KV 存储
 
@@ -420,11 +461,18 @@ bot := ilink.NewBot(
         OnHandlerPanic: func(recovered any, msg *ilink.Message) {
             log.Printf("handler panic: %v, from: %s", recovered, msg.FromUserID)
         },
+
+        // 出站拦截，详见「出站 Hook」章节
+        OnBeforeSend: func(msg *ilink.Message) error { return nil },
+        OnAfterSend:  func(msg *ilink.Message, err error) {},
     }),
 )
 ```
 
 所有 Hook 都是可选的，未设置的不会被调用。
+
+> `OnSessionExpired` 触发时，SDK 已经冻结了全部 API 调用；`OnSessionRecovered`
+> 在冻结解除且轮询恢复后触发。
 
 ---
 
@@ -450,6 +498,231 @@ err = session.Wait(ctx)
 ```
 
 `LoginStatus` 枚举：`Pending` → `Scanned` → `Confirmed` / `Expired` / `Error`
+
+---
+
+## 登录状态机与配对码
+
+扫码登录不是「等 confirmed」这么简单，服务端会返回 8 种状态，SDK 全部处理：
+
+| 状态 | 含义 | SDK 行为 |
+|---|---|---|
+| `wait` / `scaned` | 等待扫码 / 等待手机确认 | 继续轮询 |
+| `need_verifycode` | 需要输入手机上显示的配对码 | 调用 `VerifyCodeFunc` 取码，带 `verify_code` 重新轮询 |
+| `verify_code_blocked` | 配对码错误次数过多 | 刷新二维码重来，超过 3 次返回 `ErrVerifyCodeBlocked` |
+| `scaned_but_redirect` | 账号在其他 IDC | **把后续轮询切到 `redirect_host`**，否则永远等不到 confirmed |
+| `binded_redirect` | 该 bot 已绑定过本客户端 | 复用本地凭证；无凭证时返回 `ErrAlreadyBound` |
+| `expired` | 二维码过期 | 自动重新拉码并再次回调 `QRCallback`，最多 3 次 |
+| `confirmed` | 登录成功 | 保存 token / baseurl |
+
+获取二维码时会带上本地已有的 bot_token（最多 10 个），服务端据此识别已绑定的 bot：
+
+```go
+bot := ilink.NewBot(
+    // 多 bot 场景下把所有 token 交给服务端识别
+    ilink.WithLocalTokens(func() []string { return myTokenPool() }),
+)
+```
+
+### 自定义配对码输入
+
+默认从 stdin 读取。接入 Web / 桌面端时换成自己的输入通道：
+
+```go
+codeCh := make(chan string, 1)
+
+bot := ilink.NewBot(
+    ilink.WithVerifyCodeFunc(func(retry bool) (string, error) {
+        if retry {
+            ui.ShowError("配对码不正确，请重新输入")
+        }
+        ui.PromptForPairCode()
+        select {
+        case code := <-codeCh:
+            return code, nil
+        case <-time.After(2 * time.Minute):
+            return "", errors.New("配对码输入超时")
+        }
+    }),
+)
+```
+
+`LoginAsync` 会把状态变化同步到 `QRSession`，包括 `LoginStatusNeedVerifyCode`；
+二维码刷新后 `QRImage()` 返回新图，前端据此重绘即可。
+
+---
+
+## 工具调用进度
+
+AI bot 执行工具时如果一直沉默，用户会以为卡死。`ToolProgress` 推送
+`TOOL_CALL_START` / `TOOL_CALL_RESULT`（item type 11 / 12），微信端渲染成进度条：
+
+```go
+bot.OnBody(func(ctx *ilink.Context) {
+    ctx.SetRunID(uuid.NewString())   // 把这一轮的所有消息归组到同一个气泡
+
+    tp := ctx.ToolProgress()
+    defer tp.Finalize()              // 等进度消息发完，再发最终回复
+
+    var result string
+    err := tp.Track("web_search", "call-1", func() error {
+        var err error
+        result, err = searchWeb(ctx.Body())
+        return err
+    })
+    if err != nil {
+        ctx.ReplyText("搜索失败：" + err.Error())
+        return
+    }
+
+    tp.Finalize()
+    ctx.ReplyText(result)
+})
+```
+
+`Track` 会自动发 Start、执行、再按返回的 error 发 `completed` / `failed`。
+需要手动控制时用 `tp.Start(name, id)` 和 `tp.End(name, id, status)`。
+
+进度消息在后台 goroutine 按顺序发送，**永远不会阻塞或失败你的业务逻辑**——
+发送错误只记日志。`Finalize()` 幂等，可以安全地 `defer` 加显式调用。
+
+### run_id
+
+`run_id` 把一轮 agent 运行产生的所有消息（进度、中间输出、最终回复）串成一组：
+
+```go
+ctx.SetRunID("run-abc")        // 之后 ctx 的所有回复都带这个 run_id
+bot.SendTextRun(c, uid, text, "run-abc")   // 主动推送时指定
+```
+
+不设置时默认沿用入站消息的 `run_id`。
+
+---
+
+## 出站 Hook
+
+拦截每一条外发消息——包括 handler 回复、主动推送、批量发送、发送队列：
+
+```go
+bot := ilink.NewBot(ilink.WithHooks(ilink.Hooks{
+    // 改写内容；返回 ErrSendCanceled 静默丢弃
+    OnBeforeSend: func(msg *ilink.Message) error {
+        for i := range msg.ItemList {
+            if it := msg.ItemList[i].TextItem; it != nil {
+                if containsSecret(it.Text) {
+                    return ilink.ErrSendCanceled
+                }
+                it.Text = addDisclaimer(it.Text)
+            }
+        }
+        return nil
+    },
+
+    // 观测投递结果（不影响返回值）
+    OnAfterSend: func(msg *ilink.Message, err error) {
+        metrics.RecordSend(msg.ToUserID, err)
+    },
+}))
+```
+
+`OnBeforeSend` 返回非 `ErrSendCanceled` 的错误会中止发送并把错误返回给调用方。
+
+---
+
+## 斜杠指令与调试
+
+```go
+bot.Use(
+    ilink.Timing(),          // 记录消息进入时间，供耗时统计使用
+    ilink.SlashCommands(ilink.SlashCommandOptions{
+        Commands: map[string]ilink.SlashCommandFunc{
+            "/status": func(c *ilink.Context, args string) error {
+                return c.ReplyText("在线，队列 " + strconv.Itoa(queue.Pending()))
+            },
+        },
+    }),
+)
+```
+
+内置指令：
+
+- `/echo <文本>` — 原样回显，并附带「平台→SDK」「SDK 处理」的耗时明细
+- `/toggle-debug` — 按用户开关 debug 模式
+
+命中指令会 `Abort()` 掉整条链，不会流到 AI handler。未命中的 `/xxx` 正常下发。
+下游 handler 用 `ctx.DebugEnabled()` 读取 debug 开关：
+
+```go
+bot.OnBody(func(ctx *ilink.Context) {
+    reply := askAI(ctx.Body())
+    if ctx.DebugEnabled() {
+        reply += fmt.Sprintf("\n\n⏱ 总耗时 %dms", time.Since(ctx.ReceivedAt()).Milliseconds())
+    }
+    ctx.ReplyText(reply)
+})
+```
+
+用 `SlashCommandOptions{DisableBuiltins: true}` 只保留自定义指令。
+
+---
+
+## 语音转写与转码
+
+微信语音是 SILK 编码。多数情况下**不需要解码**——服务端已经附带了转写文本：
+
+```go
+bot.OnBody(func(ctx *ilink.Context) {
+    // 语音消息的 Body() 自动回落到 voice_item.text（ASR 结果）
+    ctx.ReplyText("你说的是：" + ctx.Body())
+})
+```
+
+> 用 `OnBody` 而不是 `OnText`：`OnText` 只匹配字面文本 item，语音消息会被漏掉。
+
+确实需要音频数据时：
+
+```go
+data, mime, err := bot.DownloadVoice(ctx.Ctx, ctx.Message.GetVoiceItem())
+```
+
+要转成 WAV 需要自备 SILK 解码器（SDK 不绑定 cgo 依赖）。实现 `VoiceTranscoder`，
+解出 PCM 后用 `ilink.PCMToWAV` 封装：
+
+```go
+bot := ilink.NewBot(
+    ilink.WithVoiceTranscoder(ilink.VoiceTranscoderFunc(
+        func(silk []byte, sampleRate int) ([]byte, error) {
+            pcm, err := mysilk.Decode(silk)   // 你的解码器
+            if err != nil {
+                return nil, err
+            }
+            return ilink.PCMToWAV(pcm, sampleRate), nil
+        },
+    )),
+)
+
+wav, err := bot.DownloadVoiceWAV(ctx.Ctx, ctx.Message.GetVoiceItem())
+```
+
+未配置转码器时 `DownloadVoiceWAV` 返回 `ErrNoVoiceTranscoder`；
+已经是 WAV / MP3 的负载会原样返回。
+
+### 缩略图上传
+
+图片和视频带缩略图时，接收方在文件下载完成前就能看到预览：
+
+```go
+res, err := bot.UploadWithOptions(ctx.Ctx, videoBytes, userID, ilink.UploadOptions{
+    FileType:    "video",
+    Thumb:       thumbJPEG,
+    ThumbWidth:  320,
+    ThumbHeight: 180,
+})
+ctx.ReplyItems([]ilink.MessageItem{ilink.BuildVideoItem(res, 320, 180, durationMs)})
+```
+
+缩略图与主文件共用同一个 AES key。缩略图上传失败不会导致整体失败——
+主文件已经在 CDN 上，退化成无预览发送。
 
 ---
 
@@ -583,12 +856,20 @@ SDK 定义的哨兵错误：
 | 错误 | 说明 |
 |------|------|
 | `ilink.ErrNotLoggedIn` | 调用 Run 前未调用 Login |
-| `ilink.ErrSessionExpired` | 会话过期（`-14`），poller 会自动暂停 1 小时后重试 |
+| `ilink.ErrSessionExpired` | token 失效（`-14`），poller 会自动暂停 1 小时后重试 |
 | `ilink.ErrQRCodeExpired` | 二维码多次超时，Login 返回此错误 |
+| `ilink.ErrAlreadyBound` | 该 bot 已绑定过本客户端，但本地没有可复用的凭证 |
+| `ilink.ErrVerifyCodeBlocked` | 配对码错误次数过多，被服务端拒绝 |
+| `ilink.ErrNoVerifyCodeFunc` | 服务端要求配对码但未配置 `VerifyCodeFunc` |
 | `ilink.ErrPollerStopped` | 轮询被正常停止（ctx 取消或调用 Stop） |
 | `ilink.ErrNoContextToken` | 主动发送时找不到用户的 context_token |
+| `ilink.ErrSendCanceled` | `OnBeforeSend` 主动取消了本次发送（不是故障） |
+| `ilink.ErrNoVoiceTranscoder` | 语音是 SILK，但未配置 `VoiceTranscoder` |
 
-> **Session 过期自愈**：`bot.Run()` 检测到 `-14` 后不会返回错误，而是暂停 1 小时再重试。
+> **Token 失效自愈**：`bot.Run()` 检测到 `-14` 后不会返回错误，而是**冻结全部 API 调用**
+> 并暂停 1 小时再重试。冻结期内 `SendText`、`Upload`、`SendQueue` 等都会立刻返回
+> `*ilink.SessionPausedError`，不会拿着已被拒绝的 token 反复打服务端。
+> 用 `ilink.IsSessionPaused(err)` 判断，`err.Remaining` 是剩余时长。
 > 只有主动取消 context 或调用 `bot.Stop()` 才会让 `Run()` 返回。
 
 API 层面的错误以 `*ilink.APIError` 返回：
@@ -599,8 +880,53 @@ if errors.As(err, &ae) {
     log.Printf("API 错误：code=%d msg=%s", ae.Code, ae.Message)
 }
 
-// 快捷判断 session 过期
+// 快捷判断 token 失效
 if ilink.IsSessionExpired(err) { ... }
+
+// 冻结期内的调用
+var pe *ilink.SessionPausedError
+if errors.As(err, &pe) {
+    log.Printf("会话冻结中，还剩 %v", pe.Remaining)
+}
+```
+
+> **注意**：服务端在 `ret` 和 `errcode` 两个字段中任选其一返回错误码，SDK 会同时读取。
+> 只看其中一个会把 `-14` 读成 `0`，让 `IsSessionExpired` 静默失效。
+
+---
+
+## 可观测性
+
+### 网络错误分类
+
+`ClassifyNetError` 把传输层故障归成 DNS / TCP / TLS / 超时四类，定位问题不用再读 Go 的
+原始错误串。SDK 内部（client、poller）已自动使用，也可以自己调用：
+
+```go
+if err := bot.SendText(ctx, uid, text); err != nil {
+    cls := ilink.ClassifyNetError(err)
+    log.Printf("发送失败 type=%s desc=%s code=%s", cls.Type, cls.Description, cls.Code)
+    // cls.LogArgs() 可直接展开进 slog
+    logger.Error("send failed", cls.LogArgs()...)
+}
+```
+
+| Type | 典型场景 |
+|---|---|
+| `dns` | 域名解析失败、DNS 配置错误 |
+| `tcp` | 连接被拒、网络不可达、连接超时、对端断开 |
+| `tls` | 证书不受信、域名不匹配、握手失败（常见于中间盒） |
+| `timeout` | 客户端 deadline 到期 |
+
+### 日志脱敏
+
+debug 级别日志会打印请求/响应体，SDK 自动脱敏 token、context_token、aes_key、
+typing_ticket、get_updates_buf、二维码等字段，并把 body 截断到 512 字节。
+需要自己打日志时直接复用：
+
+```go
+log.Printf("url=%s body=%s token=%s",
+    ilink.RedactURL(u), ilink.RedactBody(body), ilink.RedactToken(tok))
 ```
 
 ---

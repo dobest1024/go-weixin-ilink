@@ -22,6 +22,19 @@ type Hooks struct {
 	// OnHandlerPanic is called when a message handler panics.
 	// The recovered value and the originating message are provided.
 	OnHandlerPanic func(recovered any, msg *Message)
+
+	// OnBeforeSend runs immediately before every outbound message leaves the
+	// SDK, including replies, proactive sends, batch sends and queued sends.
+	// The message is mutable: rewrite ItemList to filter or annotate content.
+	//
+	// Return ErrSendCanceled to drop the message silently; any other error
+	// aborts the send and is returned to the caller.
+	OnBeforeSend func(msg *Message) error
+
+	// OnAfterSend runs after every outbound send attempt, with the error the
+	// API returned (nil on success). It is informational — the return value of
+	// the send is not affected.
+	OnAfterSend func(msg *Message, err error)
 }
 
 func (h *Hooks) callOnLogin() {
@@ -57,5 +70,18 @@ func (h *Hooks) callOnError(err error) {
 func (h *Hooks) callOnHandlerPanic(recovered any, msg *Message) {
 	if h.OnHandlerPanic != nil {
 		h.OnHandlerPanic(recovered, msg)
+	}
+}
+
+func (h *Hooks) callOnBeforeSend(msg *Message) error {
+	if h.OnBeforeSend != nil {
+		return h.OnBeforeSend(msg)
+	}
+	return nil
+}
+
+func (h *Hooks) callOnAfterSend(msg *Message, err error) {
+	if h.OnAfterSend != nil {
+		h.OnAfterSend(msg, err)
 	}
 }

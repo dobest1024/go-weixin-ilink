@@ -66,14 +66,15 @@ func (d *dispatcher) dispatch(ctx *Context) {
 
 // --- Built-in matchers ---
 
-func matchAll() Matcher                   { return func(*Message) bool { return true } }
-func matchText() Matcher                  { return func(m *Message) bool { return m.IsText() } }
-func matchImage() Matcher                 { return func(m *Message) bool { return m.IsImage() } }
-func matchVoice() Matcher                 { return func(m *Message) bool { return m.IsVoice() } }
-func matchFile() Matcher                  { return func(m *Message) bool { return m.IsFile() } }
-func matchVideo() Matcher                 { return func(m *Message) bool { return m.IsVideo() } }
-func matchGroup() Matcher                 { return func(m *Message) bool { return m.IsGroup() } }
-func matchPrivate() Matcher               { return func(m *Message) bool { return m.IsPrivate() } }
+func matchAll() Matcher      { return func(*Message) bool { return true } }
+func matchText() Matcher     { return func(m *Message) bool { return m.IsText() } }
+func matchImage() Matcher    { return func(m *Message) bool { return m.IsImage() } }
+func matchVoice() Matcher    { return func(m *Message) bool { return m.IsVoice() } }
+func matchFile() Matcher     { return func(m *Message) bool { return m.IsFile() } }
+func matchVideo() Matcher    { return func(m *Message) bool { return m.IsVideo() } }
+func matchGroup() Matcher    { return func(m *Message) bool { return m.IsGroup() } }
+func matchPrivate() Matcher  { return func(m *Message) bool { return m.IsPrivate() } }
+func matchBodyText() Matcher { return func(m *Message) bool { return m.HasBodyText() } }
 
 func matchTextContains(substr string) Matcher {
 	return func(m *Message) bool { return strings.Contains(m.Text(), substr) }

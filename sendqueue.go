@@ -51,10 +51,9 @@ func (b *Bot) BatchSendItems(ctx context.Context, userIDs []string, items []Mess
 				results[idx] = BatchResult{UserID: userID, Err: ErrNoContextToken}
 				return
 			}
-			msg := newBotMsg(userID, token, items)
 			results[idx] = BatchResult{
 				UserID: userID,
-				Err:    sendRaw(ctx, b.c, b.cfg.channelVersion, b.cfg.botAgent, msg),
+				Err:    b.sender().items(ctx, userID, token, items),
 			}
 		}(i, uid)
 	}
@@ -167,6 +166,5 @@ func (q *SendQueue) send(ctx context.Context, job *sendJob) {
 		job.result <- ErrNoContextToken
 		return
 	}
-	msg := newBotMsg(job.task.UserID, token, job.task.Items)
-	job.result <- sendRaw(ctx, q.bot.c, q.bot.cfg.channelVersion, q.bot.cfg.botAgent, msg)
+	job.result <- q.bot.sender().items(ctx, job.task.UserID, token, job.task.Items)
 }

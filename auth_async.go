@@ -2,20 +2,20 @@ package ilink
 
 import (
 	"context"
-	"fmt"
 	"sync"
-	"time"
 )
 
 // LoginStatus represents the current state of a QR code login session.
 type LoginStatus int
 
 const (
-	LoginStatusPending   LoginStatus = iota // QR code generated, waiting for scan
-	LoginStatusScanned                      // Scanned, waiting for phone confirmation
-	LoginStatusConfirmed                    // Login confirmed
-	LoginStatusExpired                      // QR code expired
-	LoginStatusError                        // An error occurred
+	LoginStatusPending        LoginStatus = iota // QR code generated, waiting for scan
+	LoginStatusScanned                           // Scanned, waiting for phone confirmation
+	LoginStatusNeedVerifyCode                    // Server is waiting for the pair code
+	LoginStatusConfirmed                         // Login confirmed
+	LoginStatusAlreadyBound                      // Already connected to this client; nothing to do
+	LoginStatusExpired                           // QR code expired after all refresh attempts
+	LoginStatusError                             // An error occurred
 )
 
 func (s LoginStatus) String() string {
@@ -24,8 +24,12 @@ func (s LoginStatus) String() string {
 		return "pending"
 	case LoginStatusScanned:
 		return "scanned"
+	case LoginStatusNeedVerifyCode:
+		return "need_verify_code"
 	case LoginStatusConfirmed:
 		return "confirmed"
+	case LoginStatusAlreadyBound:
+		return "already_bound"
 	case LoginStatusExpired:
 		return "expired"
 	case LoginStatusError:
@@ -43,13 +47,13 @@ type QRSession struct {
 
 	qrImgContent string // base64-encoded PNG
 	qrImgURL     string
-	qrCode       string // qrcode token for polling
 
-	auth   *auth
 	doneCh chan struct{}
 }
 
 // QRImage returns the base64-encoded QR code PNG image.
+// It changes when the code is refreshed after expiry, so re-read it on a
+// LoginStatusPending transition if you cache the rendering.
 func (s *QRSession) QRImage() string {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -100,6 +104,14 @@ func (s *QRSession) setStatus(st LoginStatus) {
 	s.mu.Unlock()
 }
 
+func (s *QRSession) setQR(imgContent, imgURL string) {
+	s.mu.Lock()
+	s.qrImgContent = imgContent
+	s.qrImgURL = imgURL
+	s.status = LoginStatusPending
+	s.mu.Unlock()
+}
+
 func (s *QRSession) finish(st LoginStatus, err error) {
 	s.mu.Lock()
 	s.status = st
@@ -115,95 +127,58 @@ func (s *QRSession) finish(st LoginStatus, err error) {
 //
 // If valid stored credentials exist, the session completes immediately
 // with LoginStatusConfirmed.
+//
+// A pair-code challenge is answered through the configured VerifyCodeFunc;
+// with a UI front-end, supply one via WithVerifyCodeFunc that blocks on your
+// own input channel rather than stdin.
 func (b *Bot) LoginAsync(ctx context.Context) (*QRSession, error) {
 	a := b.authSvc
 
-	// Try existing credentials first.
-	if a.store != nil {
-		token, baseURL, err := a.store.Load()
-		if err != nil {
-			a.logger.Warn("failed to load stored credentials", "error", err)
-		} else if token != "" {
-			a.c.setToken(token)
-			if baseURL != "" {
-				a.c.setBaseURL(baseURL)
-			}
-			a.logger.Info("validating stored credentials...")
-			if valid, vErr := a.validate(ctx); valid {
-				a.logger.Info("reusing stored credentials")
-				b.cfg.hooks.callOnLogin()
-				sess := &QRSession{doneCh: make(chan struct{})}
-				sess.finish(LoginStatusConfirmed, nil)
-				return sess, nil
-			} else if IsSessionExpired(vErr) {
-				a.logger.Info("stored credentials expired, re-login required")
-				_ = a.store.Clear()
-			} else {
-				a.logger.Warn("credential validation failed (transient), re-login required", "error", vErr)
-			}
-		}
+	if ok, _ := a.tryStoredCredentials(ctx); ok {
+		b.cfg.hooks.callOnLogin()
+		sess := &QRSession{doneCh: make(chan struct{})}
+		sess.finish(LoginStatusConfirmed, nil)
+		return sess, nil
 	}
 
-	// Fetch QR code.
-	var qr qrCodeResponse
-	if err := a.c.get(ctx, "/ilink/bot/get_bot_qrcode?bot_type=3", &qr); err != nil {
-		return nil, fmt.Errorf("get qr code: %w", err)
+	qr, err := a.fetchQRCode(ctx)
+	if err != nil {
+		return nil, err
 	}
 
 	sess := &QRSession{
 		status:       LoginStatusPending,
 		qrImgContent: qr.QRCodeImgContent,
 		qrImgURL:     qr.QRCodeImgURL,
-		qrCode:       qr.QRCode,
-		auth:         a,
 		doneCh:       make(chan struct{}),
 	}
 
-	// Poll status in background.
-	go sess.pollLoop(ctx, b)
+	// Mirror refreshed codes and the scan progress into the session so a UI can
+	// re-render without re-driving the protocol itself.
+	onQR := func(imgContent string) { sess.setQR(imgContent, "") }
+
+	go func() {
+		res, err := a.runQRFlow(ctx, qr, onQR, sess.setStatus)
+		switch {
+		case err != nil:
+			st := LoginStatusError
+			if err == ErrQRCodeExpired {
+				st = LoginStatusExpired
+			}
+			sess.finish(st, err)
+		case res.alreadyBound:
+			if ok, _ := a.tryStoredCredentials(ctx); ok {
+				b.cfg.hooks.callOnLogin()
+				sess.finish(LoginStatusConfirmed, nil)
+				return
+			}
+			sess.finish(LoginStatusAlreadyBound, ErrAlreadyBound)
+		default:
+			a.applyCredentials(res.status)
+			b.cfg.hooks.callOnLogin()
+			sess.finish(LoginStatusConfirmed, nil)
+		}
+	}()
 
 	return sess, nil
-}
-
-func (s *QRSession) pollLoop(ctx context.Context, b *Bot) {
-	a := s.auth
-	ticker := time.NewTicker(2 * time.Second)
-	defer ticker.Stop()
-
-	for {
-		select {
-		case <-ctx.Done():
-			s.finish(LoginStatusError, ctx.Err())
-			return
-		case <-ticker.C:
-			var status qrCodeStatus
-			path := fmt.Sprintf("/ilink/bot/get_qrcode_status?qrcode=%s", s.qrCode)
-			if err := a.c.get(ctx, path, &status); err != nil {
-				a.logger.Warn("poll qr status error", "error", err)
-				continue
-			}
-			switch status.Status {
-			case "scaned":
-				s.setStatus(LoginStatusScanned)
-				a.logger.Info("QR code scanned, waiting for phone confirmation...")
-			case "expired":
-				s.finish(LoginStatusExpired, ErrQRCodeExpired)
-				return
-			case "confirmed":
-				a.c.setToken(status.BotToken)
-				if status.BaseURL != "" {
-					a.c.setBaseURL(status.BaseURL)
-				}
-				if a.store != nil {
-					if err := a.store.Save(status.BotToken, status.BaseURL); err != nil {
-						a.logger.Warn("failed to save credentials", "error", err)
-					}
-				}
-				a.logger.Info("login successful")
-				b.cfg.hooks.callOnLogin()
-				s.finish(LoginStatusConfirmed, nil)
-				return
-			}
-		}
-	}
 }
